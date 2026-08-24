@@ -1,0 +1,25 @@
+{
+  "first_name": "Alex",
+  "preferred_name": "Alex",
+  "last_name": "Rivera",
+  "legal_name": "Alex Rivera",
+  "email": "alex@example.com",
+  "phone": "(555) 010-0100",
+  "linkedin": "https://linkedin.com/in/example",
+  "github": "https://github.com/example",
+  "website": "https://github.com/example",
+  "school": "State University",
+  "degree": "Bachelor of Science",
+  "major": "Computer Science",
+  "graduation": "May 2028",
+  "gpa": "3.80",
+  "location": "City, ST",
+  "languages": [
+    "Python", "TypeScript", "Java", "C", "SQL"
+  ],
+  "us_citizen": true,
+  "work_authorized_us": true,
+  "needs_sponsorship": false,
+  "willing_to_relocate": true,
+  "available_for_internship": true
+}

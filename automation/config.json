@@ -1,0 +1,38 @@
+{
+  "listings_url": "https://raw.githubusercontent.com/SimplifyJobs/Summer2027-Internships/dev/.github/scripts/listings.json",
+  "source": "https://github.com/SimplifyJobs/Summer2027-Internships",
+  "categories": [
+    "Software",
+    "Software Engineering",
+    "AI/ML/Data",
+    "Data Science, AI & Machine Learning",
+    "Quant",
+    "Quantitative Finance"
+  ],
+  "require_term": "Summer 2027",
+  "max_per_day": 10,
+  "max_queue": 40,
+  "skip_advanced_degree_only": true,
+  "title_exclude": [
+    "materials engineer",
+    "mechanical engineer",
+    "electrical engineer",
+    "product manager",
+    "reporting analyst",
+    "hardware intern",
+    "trading analyst",
+    "quant trader"
+  ],
+  "hour": 8,
+  "minute": 0,
+  "notify": true,
+  "notify_if_empty": false,
+  "open_report": false,
+  "tailor": true,
+  "fit_min_score": 0.4,
+  "retain_days": 21,
+  "retain_max_apps": 30,
+  "retain_reports_days": 14,
+  "dashboard_port": 8765,
+  "agent_timeout_s": 600
+}

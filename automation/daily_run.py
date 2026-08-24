@@ -45,7 +45,7 @@ from fit import evaluate_listing  # noqa: E402
 from cleanup import run_cleanup, tidy_folder  # noqa: E402
 from dedupe import index_from_seen  # noqa: E402
 
-UA = "InternshipWatch/1.0"
+UA = "TrackAndTailor/1.0"
 RETRY_STATUSES = frozenset({"tailor_failed", "scrape_failed"})
 
 

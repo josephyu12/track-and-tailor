@@ -99,7 +99,7 @@ Output is JSON: `ok`, `company`, `role`, `location`, `jd_text`, `questions`, `at
 
 If `ok` is false or `jd_text` is thin: WebFetch, then browse. If all of that fails, skip that URL and ask the user to paste the JD. Do not invent a posting.
 
-## Daily internship watcher
+## Track and Tailor (daily watcher)
 
 Unattended job that diffs [SimplifyJobs/Summer2027-Internships](https://github.com/SimplifyJobs/Summer2027-Internships) and tailors new SWE / ML / quant roles via Cursor Agent CLI (`agent -p --force`). Requires `agent login` (or `CURSOR_API_KEY`).
 

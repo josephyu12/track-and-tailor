@@ -17,4 +17,4 @@ alwaysApply: true
 - Keep tailored resumes to **one full page**. A short one-pager is a failed tailor.
 - Match as many true JD keywords as possible. Education stays at the top. Jobs and projects stay reverse chronological; Skills / Experience / Projects sections may be swapped as wholes.
 - Cover letters and essays: follow `.cursor/skills/tailor-resume/writing.md`. Off-resume material. No citizenship/relocation in letters. No em dashes, no colon-lists, no stacked punchy short sentences.
-- Daily watcher for SimplifyJobs listings: `automation/` (`make internships-install`, `make internships-now`). Tailors with Cursor Agent CLI.
+- Track and Tailor daily watcher for SimplifyJobs listings: `automation/` (`make internships-install`, `make internships-now`). Tailors with Cursor Agent CLI.

@@ -406,7 +406,7 @@ def page(title: str, body: str, day: str | None = None) -> bytes:
     doc = f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{html.escape(title)}</title><style>{CSS}</style></head><body>
-<header class="top"><h1>Internship dashboard</h1>
+<header class="top"><h1>Track and Tailor</h1>
 <a href="/">Overview</a><a href="/#add">Add a job</a></header>
 <div class="wrap"><nav class="side">{"".join(nav) or '<span class="muted">No days yet</span>'}</nav>
 <main class="main">{body}</main></div>
@@ -740,7 +740,7 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/":
             msg = urllib.parse.parse_qs(parsed.query).get("msg", [""])[0]
-            self._send(200, page("Internship dashboard", overview_body(msg)))
+            self._send(200, page("Track and Tailor", overview_body(msg)))
             return
         if path.startswith("/day/"):
             day = path.split("/day/", 1)[-1]
@@ -804,7 +804,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/analyze":
             slug, err = analyze(fields)
             if err:
-                self._send(200, page("Internship dashboard", overview_body(err)))
+                self._send(200, page("Track and Tailor", overview_body(err)))
                 return
             self._redir("/app/" + urllib.parse.quote(slug))
             return
@@ -844,7 +844,7 @@ class Handler(BaseHTTPRequestHandler):
             slug = path.split("/delete/", 1)[-1]
             err = delete_application(slug)
             if err:
-                self._send(200, page("Internship dashboard", overview_body(err)))
+                self._send(200, page("Track and Tailor", overview_body(err)))
                 return
             self._redir("/")
             return

@@ -1,6 +1,8 @@
-# Internship watcher
+# Track and Tailor
 
-Local pipeline that diffs [SimplifyJobs internship listings](https://github.com/SimplifyJobs/Summer2027-Internships), scores fit, scrapes the posting, and tailors a one-page LaTeX resume with the Cursor Agent CLI.
+Watch new internship listings, then tailor a one-page LaTeX resume to each one.
+
+The pipeline diffs [SimplifyJobs internship listings](https://github.com/SimplifyJobs/Summer2027-Internships), scores fit, scrapes the posting, and runs the Cursor Agent CLI against your master resume.
 
 This is a personal tool you run on your machine. It is not a hosted product. Tailoring uses your Cursor login. The listing feed is Simplify's public JSON.
 

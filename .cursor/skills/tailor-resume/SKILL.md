@@ -84,7 +84,9 @@ Rules for answers:
 python3 .cursor/skills/tailor-resume/scripts/harvest_apply_form.py 'URL'
 ```
 
-That helper opens a browser, clicks **Start Application** / Apply / Apply Manually (at most twice), then reads the form. It never fills fields and never clicks Submit. If HTTP scrape already returned real ATS questions, skip the browser step.
+That helper uses **headless** gstack browse. It clicks **Start Application** / Apply / Apply Manually (at most twice), then reads the form. It never fills fields and never clicks Submit. If HTTP scrape already returned real ATS questions, skip the harvest step.
+
+Never launch GStack Browser. Never run `$B connect`, `$B handoff`, `$B --headed`, or the gstack `/browse` skill. Login wall or CAPTCHA: write visible fields or `_None found_` and stop.
 
 - If still none, write `_None found_` — do not invent a form.
 
@@ -97,7 +99,7 @@ python3 .cursor/skills/tailor-resume/scripts/scrape_jd.py --browser 'URL'
 
 Output is JSON: `ok`, `company`, `role`, `location`, `jd_text`, `questions`, `ats`, `error`.
 
-If `ok` is false or `jd_text` is thin: WebFetch, then browse. If all of that fails, skip that URL and ask the user to paste the JD. Do not invent a posting.
+If `ok` is false or `jd_text` is thin: WebFetch the same URL. If that still fails, skip that URL and ask the user to paste the JD. Do not invent a posting. Do not open GStack Browser.
 
 ## Track and Tailor (daily watcher)
 
@@ -114,17 +116,18 @@ make internships-dashboard
 make internships-uninstall
 ```
 
-Config: `automation/config.json`. The dashboard LaunchAgent binds `127.0.0.1:8765` at login.
+Config: `automation/config.json`. The dashboard LaunchAgent binds `127.0.0.1:8765` at login. Watcher and custom-insert skip listings that are only offered outside Summer 2027 (May/June–Aug/Sep) and skip an exact duplicate apply URL. Custom insert shows an alert and does not continue. Deleting a job while it is tailoring kills the agent process group.
 
 ## Hard rules
 
 - Never invent jobs, titles, dates, employers, metrics, or unconfirmed tools.
+- Never open GStack Browser or use `$B connect` / `$B handoff`.
 - Facts come from `master/resume.tex`, `master/bank.md`, and on-demand files in [sources.md](sources.md).
 - Keep exactly **one full page**. Sparse one-pagers fail.
-- Do not change employer names, titles, dates, or GPA.
+- Do not change employer names, titles, dates, or GPA. The Yale degree line is the `showmolbio` toggle only: leave it **off** (Computer Science) unless the role itself is biology / biotech / computational biology / genomics / wet lab. A SWE or ML intern seat at a pharma company is not enough.
 - Do not rewrite the LaTeX preamble or layout macros.
 - Match as many true JD keywords as possible.
-- Keep **Education** immediately after the contact header.
+- Keep **Education** immediately after the contact header. Default degree is Computer Science. Enable `showmolbio` only for biology roles.
 - Within Education, Experience, and Projects, keep reverse chronological order.
 - Entire Technical Skills / Experience / Projects sections may be swapped as blocks when the JD clearly prefers one.
 - After compile, run:
@@ -145,7 +148,7 @@ If the posting is AI / ML / LLM / GenAI, put ML projects and skills first. Do no
 
 1. Write a new JD-matching bullet from the bank.
 2. Rephrase remaining bullets so more JD keywords appear (same facts).
-3. Enable JD-relevant extra toggles.
+3. Enable JD-relevant extra toggles (`showmolbio` when the role is biology / biotech / computational biology).
 4. Add confirmed tools to the skills line.
 5. Add individual JD-relevant courses from the bank.
 

@@ -35,23 +35,27 @@ sys.path.insert(0, str(AUTO))
 sys.path.insert(0, str(SCRAPE))
 
 from cleanup import KEEP_NAME, tidy_folder  # noqa: E402
-from daily_run import SEEN_PATH, load_config, load_json, save_json, slugify, tailor_with_cursor, write_job_md  # noqa: E402
+from daily_run import SEEN_PATH, kill_tailor_for_slug, load_config, load_json, save_json, slugify, tailor_with_cursor, write_job_md  # noqa: E402
 from dedupe import (  # noqa: E402
+    canonical_url,
     collapse_rows,
     index_from_applications,
     parse_job_identity,
     remember_deleted,
     same_job,
 )
-from fit import DEFAULT_MIN_SCORE, evaluate_fit  # noqa: E402
+from fit import DEFAULT_MIN_SCORE, evaluate_job_md, sync_fit_json, write_fit_json  # noqa: E402
 from report import parse_answers_md  # noqa: E402
 from scrape_jd import scrape_one  # noqa: E402
+from term import custom_term_alert, evaluate_term  # noqa: E402
 
 TAILOR_STATUS = STATE / "tailor_status.json"
 APPLIED_PATH = STATE / "applied.json"
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,90}$")
 _STATUS_LOCK = threading.Lock()
 _APPLIED_LOCK = threading.Lock()
+_IN_FLIGHT_LOCK = threading.Lock()
+_IN_FLIGHT_URLS: set[str] = set()
 STALE_RUNNING_GRACE_S = 90
 ANSWER_NEWER_THAN_START_S = 3
 
@@ -138,15 +142,24 @@ def _write_status_unlocked(data: dict[str, Any]) -> None:
     save_json(TAILOR_STATUS, data)
 
 
+def _status_busy(state: str | None) -> bool:
+    return state in {"running", "queued"}
+
+
 def _artifact_finished(slug: str, started: datetime | None, want: str) -> bool:
     """True when tailor output is newer than the running stamp (not the scrape copy)."""
     started_ts = started.timestamp() if started else 0.0
     pdf = APPS / slug / "resume.pdf"
     answers = APPS / slug / "application_questions.md"
-    if "resume" in want and pdf.is_file() and pdf.stat().st_mtime >= started_ts - 1:
-        return True
-    if want == "answers" and answers.is_file():
-        return answers.stat().st_mtime >= started_ts + ANSWER_NEWER_THAN_START_S
+    need_resume = "resume" in want
+    need_answers = "answers" in want
+    if need_resume:
+        if not (pdf.is_file() and pdf.stat().st_mtime >= started_ts - 1):
+            return False
+        if not need_answers:
+            return True
+    if need_answers:
+        return answers.is_file() and answers.stat().st_mtime >= started_ts + ANSWER_NEWER_THAN_START_S
     return False
 
 
@@ -156,21 +169,31 @@ def _reconcile_unlocked(data: dict[str, Any]) -> bool:
     me = os.getpid()
     changed = False
     for slug, rec in data.items():
-        if not isinstance(rec, dict) or rec.get("state") != "running":
+        if not isinstance(rec, dict) or rec.get("state") not in {"running", "queued"}:
             continue
         started = _parse_status_at(rec.get("at"))
         started_ts = started.timestamp() if started else 0.0
         want = str(rec.get("detail") or "resume+answers")
-        if _artifact_finished(slug, started, want):
+        if rec.get("state") == "running" and _artifact_finished(slug, started, want):
             rec["state"] = "done"
             rec["detail"] = (rec.get("detail") or "finished")[:500]
             rec["at"] = datetime.now().isoformat(timespec="seconds")
             rec.pop("pid", None)
             changed = True
             continue
+        if rec.get("state") == "queued":
+            dead_worker = rec.get("pid") not in (None, me)
+            if dead_worker:
+                rec["state"] = "error"
+                rec["detail"] = "interrupted (dashboard restarted)"
+                rec["at"] = datetime.now().isoformat(timespec="seconds")
+                rec.pop("pid", None)
+                changed = True
+            continue
+        phases = 2 if ("resume" in want and "answers" in want) else 1
         age = now - started_ts if started_ts else timeout + 1
         dead_worker = rec.get("pid") not in (None, me)
-        if dead_worker or age > timeout:
+        if dead_worker or age > timeout * phases:
             rec["state"] = "error"
             rec["detail"] = (
                 "interrupted (dashboard restarted)" if dead_worker
@@ -196,7 +219,7 @@ def _set_status(slug: str, state: str, detail: str = "") -> None:
         "detail": detail[:500],
         "at": datetime.now().isoformat(timespec="seconds"),
     }
-    if state == "running":
+    if state in {"running", "queued"}:
         rec["pid"] = os.getpid()
     with _STATUS_LOCK:
         data = _load_status_unlocked()
@@ -289,6 +312,7 @@ def delete_application(slug: str) -> str | None:
     folder = (APPS / slug).resolve()
     if APPS.resolve() not in folder.parents or not folder.is_dir():
         return "Application not found."
+    kill_tailor_for_slug(slug, folder)
     rec = parse_job_folder(folder) or {}
     remember_deleted(
         slug,
@@ -351,7 +375,10 @@ def parse_job_folder(folder: Path) -> dict[str, Any] | None:
             meta[k.strip().lower()] = v.strip()
     day = meta.get("date") or datetime.fromtimestamp(job.stat().st_mtime).date().isoformat()
     pdf = folder / "resume.pdf"
+    min_score = float((_cfg() or {}).get("fit_min_score") or DEFAULT_MIN_SCORE)
     fit_path = folder / "fit.json"
+    if not fit_path.is_file():
+        sync_fit_json(folder, min_score)
     fit = {}
     if fit_path.exists():
         try:
@@ -397,8 +424,8 @@ def days_from(rows: list[dict[str, Any]]) -> list[str]:
     return seen
 
 
-def page(title: str, body: str, day: str | None = None) -> bytes:
-    rows = catalog()
+def page(title: str, body: str, day: str | None = None, rows: list[dict[str, Any]] | None = None) -> bytes:
+    rows = catalog() if rows is None else rows
     days = days_from(rows)
     nav = ['<a href="/" class="%s">All days</a>' % ("on" if not day else "")]
     for d in days:
@@ -451,7 +478,7 @@ document.querySelectorAll(".js-applied").forEach(function(cb){{
     try {{
       const r = await fetch("/api/status/"+encodeURIComponent(slug), {{cache:"no-store"}});
       const j = await r.json();
-      if (j.state && j.state !== "running") location.reload();
+      if (j.state && j.state !== "running" && j.state !== "queued") location.reload();
     }} catch (e) {{}}
   }};
   setInterval(tick, 2500);
@@ -531,8 +558,8 @@ def jobs_table(rows: list[dict[str, Any]]) -> str:
     )
 
 
-def overview_body(msg: str = "") -> str:
-    rows = catalog()
+def overview_body(msg: str = "", rows: list[dict[str, Any]] | None = None) -> str:
+    rows = catalog() if rows is None else rows
     today = date.today().isoformat()
     today_rows = [r for r in rows if r["date"] == today]
     pdfs = sum(1 for r in rows if r["pdf"])
@@ -549,8 +576,9 @@ def overview_body(msg: str = "") -> str:
     )
 
 
-def day_body(day: str) -> str:
-    rows = [r for r in catalog() if r["date"] == day]
+def day_body(day: str, rows: list[dict[str, Any]] | None = None) -> str:
+    rows = catalog() if rows is None else rows
+    rows = [r for r in rows if r["date"] == day]
     return f'<div class="card"><h2>{html.escape(day)}</h2>{jobs_table(rows)}</div>' + add_form()
 
 
@@ -562,7 +590,13 @@ def app_body(slug: str) -> str:
     fit = rec.get("fit") or {}
     st = _status().get(slug) or {}
     banner = ""
-    if st.get("state") == "running":
+    busy = _status_busy(st.get("state"))
+    if st.get("state") == "queued":
+        banner = (
+            f'<div class="banner js-generating" data-slug="{html.escape(slug)}">'
+            "Waiting for another tailor to finish…</div>"
+        )
+    elif st.get("state") == "running":
         banner = (
             f'<div class="banner js-generating" data-slug="{html.escape(slug)}">'
             "Generating in progress… this page updates when it finishes.</div>"
@@ -582,7 +616,7 @@ def app_body(slug: str) -> str:
     if rec["pdf"]:
         btns.append(f'<a class="btn btn-pdf" href="/file/{urllib.parse.quote(slug)}/resume.pdf">Resume PDF</a>')
     btns.append(f'<a class="btn btn-ghost" href="/file/{urllib.parse.quote(slug)}/job.md">job.md</a>')
-    if st.get("state") != "running":
+    if not busy:
         qslug = urllib.parse.quote(slug)
         btns.append(
             f'<form method="post" action="/generate/{qslug}" style="display:inline">'
@@ -625,6 +659,30 @@ def app_body(slug: str) -> str:
 """
 
 
+def _already_saved_msg(slug: str) -> str:
+    return f"This apply URL is already saved as {slug}. Not continuing."
+
+
+def _claim_url(url: str) -> str | None:
+    """Return a blocking reason if this apply link is already in flight."""
+    cu = canonical_url(url)
+    if not cu:
+        return None
+    with _IN_FLIGHT_LOCK:
+        if cu in _IN_FLIGHT_URLS:
+            return "This apply URL is already being analyzed. Not continuing."
+        _IN_FLIGHT_URLS.add(cu)
+    return None
+
+
+def _release_url(url: str) -> None:
+    cu = canonical_url(url)
+    if not cu:
+        return
+    with _IN_FLIGHT_LOCK:
+        _IN_FLIGHT_URLS.discard(cu)
+
+
 def analyze(fields: dict[str, str]) -> tuple[str, str]:
     url = (fields.get("url") or "").strip()
     jd = (fields.get("jd") or "").strip()
@@ -635,10 +693,43 @@ def analyze(fields: dict[str, str]) -> tuple[str, str]:
         return "", "Need a URL or a pasted JD."
     if len(jd) > 200_000:
         return "", "JD is too long."
-    scraped: dict[str, Any]
+    idx = index_from_applications(APPS)
+    reuse_slug = ""
     if url:
         if not re.match(r"^https?://", url, re.I):
             return "", "URL must start with http."
+        hit = idx.match_exact_url(url)
+        if hit and (APPS / hit / "resume.pdf").is_file():
+            return "", _already_saved_msg(hit)
+        if hit:
+            reuse_slug = hit
+        busy = _claim_url(url)
+        if busy:
+            return "", busy
+    elif company and role:
+        hit = idx.match(company, role, "")
+        if hit and (APPS / hit / "resume.pdf").is_file():
+            return "", _already_saved_msg(hit)
+        if hit:
+            reuse_slug = hit
+    try:
+        return _analyze_after_gate(fields, url, jd, company, role, mode, reuse_slug)
+    finally:
+        if url:
+            _release_url(url)
+
+
+def _analyze_after_gate(
+    fields: dict[str, str],
+    url: str,
+    jd: str,
+    company: str,
+    role: str,
+    mode: str,
+    reuse_slug: str = "",
+) -> tuple[str, str]:
+    scraped: dict[str, Any]
+    if url:
         scraped = scrape_one(url, browser=True)
     else:
         scraped = {
@@ -657,9 +748,14 @@ def analyze(fields: dict[str, str]) -> tuple[str, str]:
     company = str(scraped.get("company") or company or "Company")
     role = str(scraped.get("role") or role or "Intern")
     jd_text = (scraped.get("jd_text") or jd).strip()
+    hit = reuse_slug or index_from_applications(APPS).match(company, role, url)
+    if hit and (APPS / hit / "resume.pdf").is_file():
+        return "", _already_saved_msg(hit)
+    term = evaluate_term(role, jd_text)
+    if not term.ok:
+        return "", custom_term_alert(term)
     cfg = _cfg()
     min_score = float(cfg.get("fit_min_score") or DEFAULT_MIN_SCORE)
-    fit = evaluate_fit(role, jd_text, "custom", min_score=min_score, company=company)
     listing = {
         "id": "custom-" + datetime.now().strftime("%Y%m%d%H%M%S"),
         "company_name": company,
@@ -668,21 +764,17 @@ def analyze(fields: dict[str, str]) -> tuple[str, str]:
         "category": "custom",
         "locations": [str(scraped.get("location") or "")],
     }
-    existing = index_from_applications(APPS).match(company, role, url)
-    if existing:
-        slug = existing
-    else:
-        slug = slugify(company, role, str(listing["id"]))
-        write_job_md(slug, listing, scraped, copy_master=True)
-        folder = APPS / slug
-        (folder / KEEP_NAME).write_text(
-            "Custom analysis. Delete this file to allow auto-gc.\n", encoding="utf-8"
-        )
+    slug = hit or slugify(company, role, str(listing["id"]))
+    write_job_md(slug, listing, scraped, copy_master=True)
     folder = APPS / slug
-    (folder / "fit.json").write_text(
-        json.dumps({"ok": fit.ok, "score": fit.score, "reason": fit.reason, "custom": True}, indent=2),
-        encoding="utf-8",
+    (folder / KEEP_NAME).write_text(
+        "Custom analysis. Delete this file to allow auto-gc.\n", encoding="utf-8"
     )
+    fit = evaluate_job_md(
+        (folder / "job.md").read_text(encoding="utf-8", errors="replace"),
+        min_score=min_score,
+    )
+    write_fit_json(folder, fit, extra={"custom": True})
     if mode in {"run", "tailor"}:
         if mode == "tailor":
             do_resume, do_answers = True, True
@@ -702,17 +794,34 @@ def start_tailor(
     do_answers: bool = True,
 ) -> None:
     bits = [n for n, on in (("resume", do_resume), ("answers", do_answers)) if on]
-    _set_status(slug, "running", "+".join(bits))
+    _set_status(slug, "queued", "+".join(bits))
     timeout = int(_cfg().get("agent_timeout_s") or 600)
+
+    def mark_running() -> None:
+        if (APPS / slug).is_dir():
+            _set_status(slug, "running", "+".join(bits))
 
     def work() -> None:
         try:
             ok, detail = tailor_with_cursor(
-                slug, listing, timeout, do_resume=do_resume, do_answers=do_answers
+                slug,
+                listing,
+                timeout,
+                do_resume=do_resume,
+                do_answers=do_answers,
+                on_start=mark_running,
             )
+            if not (APPS / slug).is_dir():
+                _clear_status(slug)
+                return
+            min_score = float((_cfg() or {}).get("fit_min_score") or DEFAULT_MIN_SCORE)
+            sync_fit_json(APPS / slug, min_score)
             tidy_folder(APPS / slug)
             _set_status(slug, "done" if ok else "error", detail)
         except Exception as e:
+            if not (APPS / slug).is_dir():
+                _clear_status(slug)
+                return
             _set_status(slug, "error", f"{type(e).__name__}: {e}")
 
     threading.Thread(target=work, daemon=True).start()
@@ -740,14 +849,16 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/":
             msg = urllib.parse.parse_qs(parsed.query).get("msg", [""])[0]
-            self._send(200, page("Track and Tailor", overview_body(msg)))
+            rows = catalog()
+            self._send(200, page("Track and Tailor", overview_body(msg, rows=rows), rows=rows))
             return
         if path.startswith("/day/"):
             day = path.split("/day/", 1)[-1]
             if not re.match(r"^\d{4}-\d{2}-\d{2}$", day):
                 self._send(404, page("Not found", "<p>Bad date.</p>"))
                 return
-            self._send(200, page(f"Jobs {day}", day_body(day), day=day))
+            rows = catalog()
+            self._send(200, page(f"Jobs {day}", day_body(day, rows=rows), day=day, rows=rows))
             return
         if path.startswith("/app/"):
             slug = path.split("/app/", 1)[-1]

@@ -202,5 +202,42 @@ class HarvestFollow(unittest.TestCase):
         self.assertEqual(out.get("questions"), [])
 
 
+class HarvestStaysHeadless(unittest.TestCase):
+    def test_headed_status(self) -> None:
+        from harvest_apply_form import is_headed_status
+
+        self.assertTrue(is_headed_status("Status: healthy\nMode: headed\nURL: https://x"))
+        self.assertFalse(is_headed_status("Status: healthy\nMode: launched\nURL: https://x"))
+        self.assertFalse(is_headed_status(""))
+
+    def test_ensure_headless_disconnects_headed_daemon(self) -> None:
+        from harvest_apply_form import ensure_headless
+
+        calls: list[list[str]] = []
+
+        def fake_run(args, timeout=45):
+            calls.append(list(args))
+            if args[:1] == ["status"]:
+                return 0, "Status: healthy\nMode: headed\nURL: https://x"
+            return 0, "ok"
+
+        with patch("harvest_apply_form.run_browse", side_effect=fake_run):
+            ensure_headless()
+        self.assertEqual(calls, [["status"], ["disconnect"]])
+
+    def test_ensure_headless_skips_disconnect_when_already_headless(self) -> None:
+        from harvest_apply_form import ensure_headless
+
+        calls: list[list[str]] = []
+
+        def fake_run(args, timeout=45):
+            calls.append(list(args))
+            return 0, "Status: healthy\nMode: launched"
+
+        with patch("harvest_apply_form.run_browse", side_effect=fake_run):
+            ensure_headless()
+        self.assertEqual(calls, [["status"]])
+
+
 if __name__ == "__main__":
     unittest.main()

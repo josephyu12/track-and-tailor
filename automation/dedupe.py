@@ -14,17 +14,11 @@ STATE = Path(__file__).resolve().parent / "state"
 DELETED_PATH = STATE / "deleted.json"
 
 GENERIC_EXTRA = {
-    "ai",
-    "artificial",
     "college",
     "corporate",
     "information",
-    "intelligence",
     "it",
-    "learning",
     "locations",
-    "machine",
-    "ml",
     "multiple",
     "several",
     "team",
@@ -32,12 +26,17 @@ GENERIC_EXTRA = {
     "technology",
     "various",
 }
+# Only ignore ML/AI extras when the short title is already an ML/AI role.
+ML_EXTRA = {"ai", "artificial", "intelligence", "learning", "machine", "ml"}
 
 FLUFF_SEGMENT = re.compile(
     r"""^(
         multiple\s+teams | various\s+teams | several\s+teams |
         college\s+to\s+corporate(\s+it)? |
         information\s+technology |
+        campus\s+undergraduate(\s+summer)?(\s+intern(ship)?(\s+program)?)? |
+        undergraduate\s+summer\s+intern(ship)?(\s+program)? |
+        internship\s+program |
         multiple\s+locations | various\s+locations | several\s+locations
     )$""",
     re.I | re.X,
@@ -54,6 +53,7 @@ TRACKING_QS = {
     "utm_medium",
     "utm_source",
     "utm_term",
+    "ref",
 }
 
 
@@ -86,9 +86,17 @@ def normalize_title(title: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
-def canonical_url(url: str) -> str:
+def exact_apply_url(url: str) -> str:
+    """Raw apply URL. Whitespace stripped; query string kept as-is."""
     raw = str(url or "").strip()
     if not raw.startswith("http"):
+        return ""
+    return raw
+
+
+def canonical_url(url: str) -> str:
+    raw = exact_apply_url(url)
+    if not raw:
         return ""
     p = urllib.parse.urlsplit(raw)
     query = [
@@ -111,7 +119,13 @@ def titles_equivalent(a: str, b: str) -> bool:
     if not long.startswith(short + " "):
         return False
     extra = long[len(short) :].split()
-    return bool(extra) and all(tok in GENERIC_EXTRA for tok in extra)
+    if not extra:
+        return False
+    short_toks = set(short.split())
+    allowed = set(GENERIC_EXTRA)
+    if short_toks & {"ai", "ml", "machine", "learning", "artificial", "intelligence"}:
+        allowed |= ML_EXTRA
+    return all(tok in allowed for tok in extra)
 
 
 def same_job(company_a: str, title_a: str, url_a: str, company_b: str, title_b: str, url_b: str) -> bool:
@@ -156,16 +170,30 @@ def parse_job_identity(path: Path) -> dict[str, str] | None:
 class DuplicateIndex:
     def __init__(self) -> None:
         self.keys: dict[str, str] = {}
+        self.exact_urls: dict[str, str] = {}
         self.rows: list[tuple[str, str, str, str]] = []
 
     def add(self, company: str, title: str, url: str, slug: str) -> None:
         if not slug:
             return
+        cu = canonical_url(url)
+        if cu:
+            self.exact_urls.setdefault(cu, slug)
         for key in identity_keys(company, title, url):
             self.keys.setdefault(key, slug)
         self.rows.append((company, title, url, slug))
 
+    def match_exact_url(self, url: str) -> str | None:
+        """Same apply link: ignore tracking params, trailing slash, host case."""
+        cu = canonical_url(url)
+        if not cu:
+            return None
+        return self.exact_urls.get(cu)
+
     def match(self, company: str, title: str, url: str) -> str | None:
+        hit = self.match_exact_url(url)
+        if hit:
+            return hit
         for key in identity_keys(company, title, url):
             if key in self.keys:
                 return self.keys[key]
@@ -201,12 +229,16 @@ def remember_deleted(slug: str, company: str, title: str, url: str) -> None:
     DELETED_PATH.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
-def index_from_applications(apps: Path) -> DuplicateIndex:
+def index_from_applications(
+    apps: Path, *, require_pdf: bool = False
+) -> DuplicateIndex:
     idx = DuplicateIndex()
     if not apps.is_dir():
         return idx
     for folder in apps.iterdir():
         if not folder.is_dir() or folder.name.startswith("."):
+            continue
+        if require_pdf and not (folder / "resume.pdf").is_file():
             continue
         ident = parse_job_identity(folder / "job.md")
         if ident:
@@ -214,17 +246,25 @@ def index_from_applications(apps: Path) -> DuplicateIndex:
     return idx
 
 
-def index_from_seen(seen: dict[str, Any], apps: Path | None = None) -> DuplicateIndex:
-    idx = index_from_applications(apps) if apps else DuplicateIndex()
+def index_from_seen(
+    seen: dict[str, Any],
+    apps: Path | None = None,
+    *,
+    require_pdf: bool = False,
+) -> DuplicateIndex:
+    idx = index_from_applications(apps, require_pdf=require_pdf) if apps else DuplicateIndex()
     keep = {"tailored", "scraped", "skipped_duplicate"}
     for rec in (seen or {}).values():
         if not isinstance(rec, dict) or rec.get("status") not in keep:
+            continue
+        slug = str(rec.get("slug") or "")
+        if require_pdf and (not slug or not apps or not (apps / slug / "resume.pdf").is_file()):
             continue
         idx.add(
             str(rec.get("company") or ""),
             str(rec.get("title") or ""),
             str(rec.get("url") or ""),
-            str(rec.get("slug") or ""),
+            slug,
         )
     for rec in load_deleted().values():
         if not isinstance(rec, dict):
@@ -240,10 +280,21 @@ def index_from_seen(seen: dict[str, Any], apps: Path | None = None) -> Duplicate
 
 def _row_rank(row: dict[str, Any]) -> tuple:
     slug = str(row.get("slug") or "")
+    title = str(row.get("title") or "").lower()
+    program_title = (
+        1 if ("internship program" in title or "campus undergraduate" in title) else 0
+    )
+    fit = row.get("fit") if isinstance(row.get("fit"), dict) else {}
+    try:
+        fit_score = float(fit.get("score") or 0)
+    except (TypeError, ValueError):
+        fit_score = 0.0
     return (
         0 if row.get("applied") else 1,
         0 if row.get("pdf") else 1,
         0 if row.get("keep") else 1,
+        0 if fit_score >= 0.4 else 1,
+        program_title,
         0 if not re.search(r"-[0-9a-f]{8}$", slug) and "custom" not in slug else 1,
         len(slug),
         slug,

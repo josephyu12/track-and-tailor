@@ -12,9 +12,10 @@ alwaysApply: true
 - When the user pastes a job description, pastes application/job URLs, or asks to tailor/apply: follow `.cursor/skills/tailor-resume/SKILL.md`.
 - After compile, run `python3 .cursor/skills/tailor-resume/scripts/check_resume.py applications/{slug}`. Italic project headings must not shove the date. If GPU names are already in a project's bullets, do not also put them on the italic heading.
 - For URLs, scrape first with `python3 .cursor/skills/tailor-resume/scripts/scrape_jd.py URL`. Never invent a JD.
+- Never launch GStack Browser. Never run `$B connect`, `$B handoff`, `$B --headed`, or the gstack `/browse` skill. Job pages: `scrape_jd.py`, `harvest_apply_form.py` (headless), then WebFetch. Login wall or CAPTCHA: write visible fields or None found and stop.
 - Write each version to `applications/{company}-{role}/` (`resume.tex`, `job.md`, `application_questions.md`, `resume.pdf`).
 - When scraping a posting, also scrape apply-form questions and draft answers. If the form is not on the listing, click Start Application / Apply (never Submit). Never invent work auth, visa, or EEO data.
 - Keep tailored resumes to **one full page**. A short one-pager is a failed tailor.
-- Match as many true JD keywords as possible. Education stays at the top. Jobs and projects stay reverse chronological; Skills / Experience / Projects sections may be swapped as wholes.
+- Match as many true JD keywords as possible. Education stays at the top. Default Yale degree is Computer Science (`showmolbio` off); turn the toggle on only when the role itself is biology / biotech / computational biology. Jobs and projects stay reverse chronological; Skills / Experience / Projects sections may be swapped as wholes.
 - Cover letters and essays: follow `.cursor/skills/tailor-resume/writing.md`. Off-resume material. No citizenship/relocation in letters. No em dashes, no colon-lists, no stacked punchy short sentences.
 - Track and Tailor daily watcher for SimplifyJobs listings: `automation/` (`make internships-install`, `make internships-now`). Tailors with Cursor Agent CLI.

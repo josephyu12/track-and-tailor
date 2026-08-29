@@ -121,6 +121,27 @@ def run_browse(args: list[str], timeout: int = 45) -> tuple[int, str]:
     return proc.returncode, unwrap(proc.stdout or "")
 
 
+def is_headed_status(raw: str) -> bool:
+    for line in (raw or "").splitlines():
+        if line.lower().startswith("mode:") and "headed" in line.lower():
+            return True
+    return False
+
+
+def ensure_headless() -> None:
+    """Leave headed GStack Browser if a prior $B connect left the daemon visible."""
+    try:
+        _code, status = run_browse(["status"], timeout=10)
+    except (FileNotFoundError, subprocess.TimeoutExpired, subprocess.SubprocessError):
+        return
+    if not is_headed_status(status):
+        return
+    try:
+        run_browse(["disconnect"], timeout=20)
+    except (FileNotFoundError, subprocess.TimeoutExpired, subprocess.SubprocessError):
+        pass
+
+
 def _parse_json(blob: str) -> Any:
     text = unwrap(blob)
     if not text:
@@ -152,6 +173,7 @@ def harvest_apply_form(url: str, timeout: int = 60) -> dict[str, Any]:
     if not find_browse():
         out["error"] = "browse_not_found"
         return out
+    ensure_headless()
     deadline = time.time() + max(15, timeout)
     js_path = ""
     try:

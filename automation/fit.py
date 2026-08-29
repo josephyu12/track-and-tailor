@@ -3,13 +3,16 @@
 
 Default skill list is a generic SWE/ML intern stack. Edit SKILLS or
 automation/config.json if your background is different. Trading, hardware,
-product, and specialized robotics/CV roles are skipped by default.
+product, and specialized robotics/SLAM/lidar roles are skipped by default.
+CNN / spectrogram computer vision is in-scope.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 # Keep aligned with master/resume.tex skills + experience.
@@ -21,6 +24,7 @@ SKILLS = (
     "machine learning", "deep learning", "llm", "backend", "full-stack", "fullstack",
     "data structures", "algorithms", "distributed", "api", "microservices",
     "cloud", "gpu", "pytorch", "scikit",
+    "cnn", "keras", "computer vision", "signal processing",
 )
 
 TITLE_SWE = re.compile(
@@ -34,7 +38,7 @@ TITLE_SWE = re.compile(
 TITLE_ML_DATA = re.compile(
     r"machine learning|\bml\b|\bai\b|data science|data scientist|data engineer|"
     r"analytics|modeling program|quantitative developer|quant developer|"
-    r"quant research engineer",
+    r"quant research engineer|research scientist",
     re.I,
 )
 TITLE_SKIP = re.compile(
@@ -50,7 +54,7 @@ TITLE_SKIP = re.compile(
     re.I,
 )
 DOMAIN_PENALTY = re.compile(
-    r"\bperception\b|computer vision|\bcv intern\b|\brobotics\b|\bslam\b|"
+    r"\bperception\b|\bcv intern\b|\brobotics\b|\bslam\b|"
     r"\blidar\b|\bdrone\b|autonomous vehicle|tensorrt|controls intern|"
     r"embedded firmware|rf engineer|antenna|solidworks|\bcad\b|"
     r"fixed income|trade floor|sell-side|portfolio management|"
@@ -145,7 +149,7 @@ def evaluate_fit(
 
     penalties = DOMAIN_PENALTY.findall(text)
     if penalties:
-        # Specialized robotics/CV/trading language vs the user's actual work.
+        # Specialized robotics/SLAM/lidar/trading language vs the user's actual work.
         uniq = {p.lower() for p in penalties}
         penalty = min(0.28, 0.08 * len(uniq))
         score -= penalty
@@ -174,3 +178,95 @@ def evaluate_listing(
         min_score=min_score,
         company=str(listing.get("company_name") or listing.get("company") or ""),
     )
+
+
+def write_fit_json(folder: Path, fit: Fit, extra: dict[str, Any] | None = None) -> Path:
+    """Sidecar the dashboard reads. Scoring itself is local regex, not an LLM call."""
+    folder.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {"ok": fit.ok, "score": fit.score, "reason": fit.reason}
+    if extra:
+        payload.update(extra)
+    path = folder / "fit.json"
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def sync_fit_json(folder: Path, min_score: float = DEFAULT_MIN_SCORE) -> bool:
+    """Rescore from job.md. Overwrites a stale fit.json. Preserves extra keys."""
+    job = folder / "job.md"
+    if not job.is_file():
+        return False
+    fit = evaluate_job_md(job.read_text(encoding="utf-8", errors="replace"), min_score)
+    extra: dict[str, Any] = {}
+    path = folder / "fit.json"
+    if path.is_file():
+        try:
+            old = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            old = {}
+        if isinstance(old, dict):
+            extra = {k: v for k, v in old.items() if k not in {"ok", "score", "reason"}}
+            if (
+                old.get("ok") == fit.ok
+                and old.get("score") == fit.score
+                and old.get("reason") == fit.reason
+            ):
+                return False
+    write_fit_json(folder, fit, extra=extra or None)
+    return True
+
+
+def fields_from_job_md(text: str) -> dict[str, str]:
+    company, role, category = "", "", ""
+    jd_lines: list[str] = []
+    in_jd = False
+    for line in text.splitlines():
+        if line.startswith("# "):
+            title = line[2:].strip()
+            if " — " in title:
+                company, role = title.split(" — ", 1)
+            else:
+                company = title
+        elif line.startswith("- ") and ":" in line:
+            key, val = line[2:].split(":", 1)
+            if key.strip().lower() == "category":
+                category = val.strip()
+        elif line.strip() == "## Job description":
+            in_jd = True
+        elif in_jd and line.startswith("## "):
+            break
+        elif in_jd:
+            jd_lines.append(line)
+    return {
+        "company": company,
+        "role": role,
+        "category": category,
+        "jd": "\n".join(jd_lines).strip(),
+    }
+
+
+def evaluate_job_md(text: str, min_score: float = DEFAULT_MIN_SCORE) -> Fit:
+    fields = fields_from_job_md(text)
+    return evaluate_fit(
+        fields["role"],
+        fields["jd"],
+        fields["category"],
+        min_score=min_score,
+        company=fields["company"],
+    )
+
+
+def backfill_missing_fits(
+    apps: Path,
+    min_score: float = DEFAULT_MIN_SCORE,
+) -> int:
+    """Write or refresh fit.json from each folder's job.md."""
+    if not apps.is_dir():
+        return 0
+    wrote = 0
+    for folder in sorted(apps.iterdir()):
+        if not folder.is_dir() or folder.name.startswith("."):
+            continue
+        if sync_fit_json(folder, min_score):
+            wrote += 1
+    return wrote

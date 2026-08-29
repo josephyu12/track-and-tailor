@@ -2,7 +2,7 @@
 """Keep application folders from growing without bound.
 
 Policy (see config retain_*):
-- Always strip LaTeX aux files and duplicate resume.pdf
+- Always strip LaTeX aux files and extra PDFs; never delete resume.pdf
 - Delete empty leftover folders (no job.md and no submit PDF)
 - Keep failed-tailor folders that still have job.md so retry/dashboard do not 404
 - Delete folders older than retain_days unless they contain `.keep`
@@ -37,7 +37,7 @@ def _mtime(path: Path) -> float:
 
 
 def tidy_folder(folder: Path) -> list[str]:
-    """Remove compile junk and duplicate PDFs. Keep resume.pdf + sources."""
+    """Remove compile junk and extra PDFs. Keep resume.pdf + sources."""
     removed: list[str] = []
     if not folder.is_dir():
         return removed
@@ -49,7 +49,7 @@ def tidy_folder(folder: Path) -> list[str]:
             path.unlink(missing_ok=True)
             removed.append(path.name)
             continue
-        if path.name == "resume.pdf" and submit.exists():
+        if path.suffix.lower() == ".pdf" and path.name != "resume.pdf" and submit.is_file():
             path.unlink(missing_ok=True)
             removed.append(path.name)
     return removed
@@ -85,11 +85,12 @@ def prune_applications(
         return stats
 
     folders = [p for p in APPS.iterdir() if p.is_dir() and not p.name.startswith(".")]
-    kept: list[Path] = []
+    aged: list[tuple[float, Path]] = []
     now_ts = now.timestamp()
     for folder in folders:
-        if now_ts - _mtime(folder) < 180:
-            kept.append(folder)
+        age_mtime = _mtime(folder)
+        if now_ts - age_mtime < 180:
+            aged.append((age_mtime, folder))
             continue
         n = len(tidy_folder(folder))
         if n:
@@ -98,18 +99,20 @@ def prune_applications(
             _rmtree(folder)
             stats["stubs"] += 1
             continue
-        if _mtime(folder) < cutoff and not (folder / KEEP_NAME).exists():
+        if age_mtime < cutoff and not (folder / KEEP_NAME).exists():
             _rmtree(folder)
             stats["expired"] += 1
             continue
-        kept.append(folder)
+        aged.append((age_mtime, folder))
 
-    kept.sort(key=_mtime)
+    aged.sort(key=lambda pair: pair[0])
+    kept = [p for _, p in aged]
     while len(kept) > retain_max:
         victims = [p for p in kept if not (p / KEEP_NAME).exists()]
         if not victims:
             break
-        folder = victims[0]
+        no_pdf = [p for p in victims if not (p / "resume.pdf").is_file()]
+        folder = (no_pdf or victims)[0]
         _rmtree(folder)
         kept.remove(folder)
         stats["capped"] += 1

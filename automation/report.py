@@ -174,12 +174,12 @@ def _counts(results: list[dict[str, Any]]) -> dict[str, int]:
         st = r.get("status")
         if st == "tailored":
             out["tailored"] += 1
-        elif st in {"skipped_fit", "skipped_duplicate"}:
+        elif st in {"skipped_fit", "skipped_duplicate", "skipped_term"}:
             out["skipped"] += 1
         elif st not in {"scraped", "dry_run"}:
             out["failed"] += 1
         slug = r.get("slug") or ""
-        if not slug or st in {"skipped_fit", "skipped_duplicate"}:
+        if not slug or st in {"skipped_fit", "skipped_duplicate", "skipped_term"}:
             continue
         for item in parse_answers_md(job_paths(slug)["answers"]):
             if item["state"] == "needs":
@@ -190,8 +190,8 @@ def _counts(results: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def _partition(results: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    skipped = [r for r in results if r.get("status") in {"skipped_fit", "skipped_duplicate"}]
-    rest = [r for r in results if r.get("status") not in {"skipped_fit", "skipped_duplicate"}]
+    skipped = [r for r in results if r.get("status") in {"skipped_fit", "skipped_duplicate", "skipped_term"}]
+    rest = [r for r in results if r.get("status") not in {"skipped_fit", "skipped_duplicate", "skipped_term"}]
     return rest, skipped
 
 
@@ -209,7 +209,7 @@ def render_markdown(
         "",
         f"Source: {cfg.get('source')}",
         f"Mode: {'dry-run' if dry_run else 'live'}",
-        f"Ready: **{counts['tailored']}** tailored · **{counts['skipped']}** skipped (not a fit / duplicate) · **{counts['needs']}** fields need you · {len(leftover)} still queued",
+        f"Ready: **{counts['tailored']}** tailored · **{counts['skipped']}** skipped (fit / duplicate / term) · **{counts['needs']}** fields need you · {len(leftover)} still queued",
         "",
         "Open the HTML report for one-click Apply / Resume / Copy: "
         f"`automation/reports/{day}.html`",
@@ -562,7 +562,7 @@ def _html_job(r: dict[str, Any], slug: str, idx: int, anchor: str) -> str:
         "badge-tailored"
         if status == "tailored"
         else "badge-skipped"
-        if status in {"skipped_fit", "skipped_duplicate"}
+        if status in {"skipped_fit", "skipped_duplicate", "skipped_term"}
         else "badge-failed"
         if "fail" in status
         else "badge-other"

@@ -28,9 +28,9 @@ SimplifyJobs JSON  →  fit filter  →  scrape JD + apply form  →  Cursor Age
                                         local dashboard on 127.0.0.1:8765
 ```
 
-**Track.** A launchd job (default 8:00 local) diffs the SimplifyJobs Summer 2027 list. Software, ML/data, and quant only. PhD-only, hardware, PM, and trader titles are skipped. You cap how many get tailored per day so a busy morning does not melt your Cursor quota.
+**Track.** A launchd job (default 8:00 local) diffs the SimplifyJobs Summer 2027 list. Software, ML/data, and quant only. PhD-only, hardware, PM, and trader titles are skipped. Off-season internships (not Summer 2027, May/June–Aug/Sep) and exact duplicate apply URLs are skipped. You cap how many get tailored per day so a busy morning does not melt your Cursor quota.
 
-**Read the posting.** Stdlib scrapers hit Greenhouse, Lever, Ashby, Apple Jobs, Workday, and Oracle HCM APIs first, then JSON-LD, then HTML. If the apply form is not on the listing, a browser helper clicks Start Application / Apply / Apply Manually, reads the fields, and **stops**. It never fills the form and never clicks Submit.
+**Read the posting.** Stdlib scrapers hit Greenhouse, Lever, Ashby, Apple Jobs, Workday, and Oracle HCM APIs first, then JSON-LD, then HTML. If the apply form is not on the listing, a **headless** helper clicks Start Application / Apply / Apply Manually, reads the fields, and **stops**. It never opens GStack Browser, never fills the form, and never clicks Submit.
 
 **Tailor.** Cursor Agent CLI copies your `master/resume.tex`, flips the etoolbox toggles that match the JD, writes new bullets only from `master/bank.md` and your profile, compiles with `latexmk`, and refuses to ship a two-page PDF or a sparse one-pager. A format checker catches the boring failure mode where a long italic project stack shoves the date into the GPU names.
 

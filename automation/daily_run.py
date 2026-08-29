@@ -12,6 +12,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -29,6 +30,7 @@ CONFIG_PATH = AUTO / "config.json"
 SEEN_PATH = STATE_DIR / "seen.json"
 QUEUE_PATH = STATE_DIR / "queue.json"
 LOCK_PATH = STATE_DIR / "lock"
+TAILOR_LOCK_PATH = STATE_DIR / "tailor.lock"
 SCRAPE_DIR = ROOT / ".cursor" / "skills" / "tailor-resume" / "scripts"
 CHECK_SCRIPT = SCRAPE_DIR / "check_resume.py"
 
@@ -41,12 +43,30 @@ from application_questions import (  # noqa: E402
     render_answers_md,
 )
 from report import collect_today, write_daily_report  # noqa: E402
-from fit import evaluate_listing  # noqa: E402
+from fit import backfill_missing_fits, evaluate_listing, sync_fit_json, write_fit_json  # noqa: E402
 from cleanup import run_cleanup, tidy_folder  # noqa: E402
 from dedupe import index_from_seen  # noqa: E402
+from term import evaluate_listing_term  # noqa: E402
 
 UA = "TrackAndTailor/1.0"
+# Agents were opening GStack Browser ($B connect / $B handoff) on CAPTCHA.
+# Harvest stays headless via harvest_apply_form.py; never a visible window.
+ANSWERS_NO_VISIBLE_BROWSER = (
+    "Never open a visible browser. Never use the gstack /browse or "
+    "/open-gstack-browser skills, $B connect, $B handoff, or headed Chromium. "
+    "If harvest_apply_form.py fails, hits a login wall, or hits a CAPTCHA, write "
+    "the visible fields or None found and stop."
+)
 RETRY_STATUSES = frozenset({"tailor_failed", "scrape_failed"})
+SKIPPED_STATUSES = frozenset({"skipped_fit", "skipped_duplicate", "skipped_term"})
+NO_PDF_RETRY = frozenset({"tailored", "scraped", "skipped_duplicate"}) | RETRY_STATUSES
+DONE_WITHOUT_RETRY = frozenset(
+    {"seeded", "deleted", "dry_run", "skipped_fit", "skipped_term"}
+)
+PIDFILE_NAME = ".tailor.pid"
+_AGENT_LOCK = threading.Lock()
+_ACTIVE_AGENTS: dict[str, subprocess.Popen[Any]] = {}
+_TAILOR_SLOT = threading.Lock()
 
 
 def load_config() -> dict[str, Any]:
@@ -248,10 +268,45 @@ def cursor_agent_argv() -> list[str] | None:
     return None
 
 
+def _needs_resume(rec: Any) -> bool:
+    """New listings, failures, and folders that lost resume.pdf should run again."""
+    if not isinstance(rec, dict):
+        return True
+    status = rec.get("status")
+    if status in DONE_WITHOUT_RETRY:
+        return False
+    if status == "skipped_overflow":
+        return True
+    slug = str(rec.get("slug") or "")
+    if slug and (ROOT / "applications" / slug / "resume.pdf").is_file():
+        return False
+    return status in NO_PDF_RETRY or not status
+
+
 def reset_resume_tex(slug: str) -> None:
     dest = ROOT / "applications" / slug
     dest.mkdir(parents=True, exist_ok=True)
     shutil.copy(ROOT / "master" / "resume.tex", dest / "resume.tex")
+
+
+def _pidfile(slug: str, folder: Path | None = None) -> Path:
+    base = folder if folder is not None else (ROOT / "applications" / slug)
+    return base / PIDFILE_NAME
+
+
+def _kill_pid_group(pid: int) -> None:
+    if not pid:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(pid, signal.SIGKILL)
+            return
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
 
 
 def _kill_process_group(proc: subprocess.Popen[Any]) -> None:
@@ -263,16 +318,32 @@ def _kill_process_group(proc: subprocess.Popen[Any]) -> None:
     """
     if proc.poll() is not None:
         return
-    try:
-        if proc.pid and os.name == "posix":
-            os.killpg(proc.pid, signal.SIGKILL)
-            return
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
+    _kill_pid_group(proc.pid or 0)
     try:
         proc.kill()
     except ProcessLookupError:
         pass
+
+
+def kill_tailor_for_slug(slug: str, folder: Path | None = None) -> bool:
+    """Kill the agent process group for this slug. Safe if nothing is running."""
+    killed = False
+    with _AGENT_LOCK:
+        proc = _ACTIVE_AGENTS.pop(slug, None)
+    if proc is not None:
+        _kill_process_group(proc)
+        killed = True
+    path = _pidfile(slug, folder)
+    if path.is_file():
+        try:
+            pid = int(path.read_text(encoding="utf-8").strip())
+        except ValueError:
+            pid = 0
+        if pid:
+            _kill_pid_group(pid)
+            killed = True
+        path.unlink(missing_ok=True)
+    return killed
 
 
 def _decode_pipe(raw: str | bytes | None) -> str:
@@ -288,6 +359,7 @@ def run_agent_cmd(
     timeout: int,
     cwd: str,
     env: dict[str, str] | None = None,
+    slug: str | None = None,
 ) -> tuple[int | None, str, bool]:
     """Run the agent CLI. Returns (returncode, combined output, timed_out)."""
     popen_kw: dict[str, Any] = {
@@ -300,18 +372,61 @@ def run_agent_cmd(
     if os.name == "posix":
         popen_kw["start_new_session"] = True
     proc = subprocess.Popen(cmd, **popen_kw)
-    timed_out = False
-    try:
-        out, err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as first:
-        timed_out = True
-        _kill_process_group(proc)
+    if slug:
+        with _AGENT_LOCK:
+            _ACTIVE_AGENTS[slug] = proc
         try:
-            out, err = proc.communicate(timeout=8)
-        except subprocess.TimeoutExpired as second:
-            _kill_process_group(proc)
-            out = second.stdout if second.stdout is not None else first.stdout
-            err = second.stderr if second.stderr is not None else first.stderr
+            path = _pidfile(slug)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(str(proc.pid or ""), encoding="utf-8")
+        except OSError:
+            pass
+    timed_out = False
+    out: str | bytes | None = None
+    err: str | bytes | None = None
+    try:
+        if slug:
+            deadline = time.time() + timeout
+            while True:
+                if not (ROOT / "applications" / slug).is_dir():
+                    _kill_process_group(proc)
+                    timed_out = True
+                    break
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    timed_out = True
+                    _kill_process_group(proc)
+                    break
+                try:
+                    out, err = proc.communicate(timeout=min(1.0, max(0.05, remaining)))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            if timed_out:
+                try:
+                    out, err = proc.communicate(timeout=8)
+                except subprocess.TimeoutExpired as second:
+                    _kill_process_group(proc)
+                    out = second.stdout if second.stdout is not None else out
+                    err = second.stderr if second.stderr is not None else err
+        else:
+            try:
+                out, err = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired as first:
+                timed_out = True
+                _kill_process_group(proc)
+                try:
+                    out, err = proc.communicate(timeout=8)
+                except subprocess.TimeoutExpired as second:
+                    _kill_process_group(proc)
+                    out = second.stdout if second.stdout is not None else first.stdout
+                    err = second.stderr if second.stderr is not None else first.stderr
+    finally:
+        if slug:
+            with _AGENT_LOCK:
+                if _ACTIVE_AGENTS.get(slug) is proc:
+                    _ACTIVE_AGENTS.pop(slug, None)
+            _pidfile(slug).unlink(missing_ok=True)
     combined = (_decode_pipe(out) + ("\n" + _decode_pipe(err) if err else "")).strip()
     return proc.poll(), combined, timed_out
 
@@ -328,16 +443,14 @@ def format_check_resume(slug: str) -> tuple[bool, str]:
     return proc.returncode == 0, msg
 
 
-def tailor_with_cursor(
+def _tailor_phase(
     slug: str,
     listing: dict[str, Any],
     timeout: int,
     *,
-    do_resume: bool = True,
-    do_answers: bool = True,
+    do_resume: bool,
+    do_answers: bool,
 ) -> tuple[bool, str]:
-    if not do_resume and not do_answers:
-        return False, "nothing to generate"
     argv = cursor_agent_argv()
     if not argv:
         return False, (
@@ -351,13 +464,15 @@ def tailor_with_cursor(
     if do_resume:
         tasks.append(
             f"Copy of master is at {folder}/resume.tex (already reset). Tailor that resume.tex only. "
-            "Compile with latexmk -pdf -interaction=nonstopmode in that folder, then "
-            "cp resume.pdf resume.pdf. Then run python3 .cursor/skills/tailor-resume/scripts/check_resume.py "
+            "Compile with latexmk -pdf -interaction=nonstopmode in that folder. The submit file is "
+            f"{folder}/resume.pdf. Run python3 .cursor/skills/tailor-resume/scripts/check_resume.py "
             f"{folder} and fix until it prints OK (heading/date collision, GPU names duplicated in heading and bullets, page count). "
-            "Then latexmk -C && rm -f resume.pdf. Keep exactly one FULL page: "
+            "Then latexmk -c (lowercase) to drop aux files. Do not run latexmk -C; that deletes resume.pdf. "
+            "Keep exactly one FULL page. "
             "Keep high school on by default (master already fills one page with it). Drop HS only if the PDF overflows to two pages after keyword edits. "
             "If you drop high school, fill the space from master/bank.md (extra bullets, courses, JD keywords). "
-            "A short sparse one-pager is a failed tailor. Match as many true JD keywords as possible."
+            "A short sparse one-pager is a failed tailor. Match as many true JD keywords as possible. "
+            "Do not open a browser or harvest the apply form in this step."
         )
     if do_answers:
         tasks.append(
@@ -366,8 +481,7 @@ def tailor_with_cursor(
             "python3 .cursor/skills/tailor-resume/scripts/harvest_apply_form.py on the posting URL. "
             "That helper clicks Start Application / Apply / Apply Manually, then reads the form. "
             "Never click Submit, Send application, or Next through the form. "
-            "If you browse by hand, use $B wait --load (not --networkidle), then $B forms and $B html. "
-            "Login wall: list only visible fields. CAPTCHA: $B handoff. "
+            f"{ANSWERS_NO_VISIBLE_BROWSER} "
             "Fill each answer from master/resume.tex, master/bank.md, "
             "and .cursor/skills/tailor-resume/profile.json only. Replace DRAFT / Needs user only when "
             "those files have the fact; otherwise leave Needs user. Never invent facts. "
@@ -379,7 +493,10 @@ def tailor_with_cursor(
     if do_resume and not do_answers:
         tasks.append(f"Do not rewrite {folder}/application_questions.md.")
     if do_answers and not do_resume:
-        tasks.append(f"Do not edit {folder}/resume.tex and do not compile a PDF.")
+        tasks.append(
+            f"Do not edit {folder}/resume.tex, do not compile, and do not run latexmk. "
+            "Leave resume.pdf untouched."
+        )
     prompt = f"""Follow .cursor/skills/tailor-resume/SKILL.md exactly. Do not edit master/resume.tex.
 
 Company: {listing.get('company_name')}
@@ -389,6 +506,7 @@ Slug: {slug}
 
 The JD is already at {folder}/job.md.
 Keep Education at the top. Keep jobs and projects reverse chronological. You may reorder the Technical Skills, Experience, and Projects sections as whole blocks.
+Degree line: leave showmolbio off (Bachelor of Science in Computer Science) unless the role itself is biology, biotech, computational biology, genomics, or wet lab. A SWE/ML intern seat at a pharma company is not enough; do not print Molecular Biology on those.
 If this role is AI Engineer, ML Engineer, LLM, GenAI, or similar, apply the skill's AI / ML pack in full (heavy). Do not leave the master default.
 {chr(10).join('- ' + t for t in tasks)}
 Never invent facts.
@@ -408,9 +526,17 @@ Reply with the changelog format from the skill, nothing else.
         prompt,
     ]
     env = os.environ.copy()
-    code, out, timed_out = run_agent_cmd(cmd, timeout, str(ROOT), env)
-    pdf = ROOT / "applications" / slug / "resume.pdf"
     answers = ROOT / "applications" / slug / "application_questions.md"
+    answers_mtime = answers.stat().st_mtime if answers.is_file() else 0.0
+    code, out, timed_out = run_agent_cmd(cmd, timeout, str(ROOT), env, slug=slug)
+    pdf = ROOT / "applications" / slug / "resume.pdf"
+
+    def _answers_rewritten() -> bool:
+        if not answers.is_file():
+            return False
+        if answers.stat().st_mtime < answers_mtime + 0.05:
+            return False
+        return len(answers.read_text(encoding="utf-8", errors="replace")) > 80
     auth_fail = (
         "not logged in" in out.lower()
         or "not authenticated" in out.lower()
@@ -430,7 +556,7 @@ Reply with the changelog format from the skill, nothing else.
                 return False, fmt or tail or "format check failed"
             return True, tail or f"timed out after {timeout}s but PDF exists"
         if do_answers and not do_resume:
-            if answers.exists() and len(answers.read_text(encoding="utf-8", errors="replace")) > 80:
+            if _answers_rewritten():
                 return True, tail or f"timed out after {timeout}s but answers exist"
         return False, tail or f"cursor agent timed out after {timeout}s"
     if do_resume:
@@ -440,9 +566,49 @@ Reply with the changelog format from the skill, nothing else.
                 return False, fmt or "format check failed"
             return True, tail
         return False, tail or f"cursor agent exit {code} (no PDF)"
-    if answers.exists() and len(answers.read_text(encoding="utf-8", errors="replace")) > 80:
+    if _answers_rewritten():
         return True, tail
     return False, tail or f"cursor agent exit {code}"
+
+
+def tailor_with_cursor(
+    slug: str,
+    listing: dict[str, Any],
+    timeout: int,
+    *,
+    do_resume: bool = True,
+    do_answers: bool = True,
+    on_start: Any | None = None,
+) -> tuple[bool, str]:
+    if not do_resume and not do_answers:
+        return False, "nothing to generate"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_fh = TAILOR_LOCK_PATH.open("w")
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        with _TAILOR_SLOT:
+            if on_start:
+                on_start()
+            if do_resume and do_answers:
+                ok_r, det_r = _tailor_phase(
+                    slug, listing, timeout, do_resume=True, do_answers=False
+                )
+                if not (ROOT / "applications" / slug).is_dir():
+                    return False, det_r or "application folder deleted"
+                if not ok_r:
+                    return False, det_r
+                ok_a, det_a = _tailor_phase(
+                    slug, listing, timeout, do_resume=False, do_answers=True
+                )
+                if ok_a:
+                    return True, det_a or det_r
+                return True, f"resume ok; answers failed: {det_a}"
+            return _tailor_phase(
+                slug, listing, timeout, do_resume=do_resume, do_answers=do_answers
+            )
+    finally:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+        lock_fh.close()
 
 
 def notify(title: str, body: str) -> None:
@@ -555,11 +721,7 @@ def run(args: argparse.Namespace) -> int:
         log(f"seed-only complete, seen={len(seen)}")
         return 0
 
-    queue = [
-        x
-        for x in matched
-        if str(x["id"]) not in seen or seen[str(x["id"])].get("status") in RETRY_STATUSES
-    ]
+    queue = [x for x in matched if _needs_resume(seen.get(str(x["id"])))]
     overflow = 0
     if len(queue) > int(cfg.get("max_queue") or 40):
         overflow = len(queue) - int(cfg["max_queue"])
@@ -574,14 +736,15 @@ def run(args: argparse.Namespace) -> int:
         queue = queue[: int(cfg["max_queue"])]
         save_json(SEEN_PATH, seen)
 
-    dup_idx = index_from_seen(seen, ROOT / "applications")
+    dup_idx = index_from_seen(seen, ROOT / "applications", require_pdf=True)
     kept_queue: list[dict[str, Any]] = []
     dup_rows: list[dict[str, Any]] = []
     for item in queue:
         company = str(item.get("company_name") or "company")
         title = str(item.get("title") or "intern")
         url = str(item.get("url") or "")
-        hit = dup_idx.match(company, title, url)
+        exact = dup_idx.match_exact_url(url)
+        hit = exact or dup_idx.match(company, title, url)
         if hit:
             rec = {
                 "id": str(item["id"]),
@@ -590,7 +753,7 @@ def run(args: argparse.Namespace) -> int:
                 "url": url,
                 "slug": hit,
                 "status": "skipped_duplicate",
-                "detail": f"duplicate of {hit}",
+                "detail": f"same apply URL as {hit}" if exact else f"duplicate of {hit}",
                 "at": datetime.now().isoformat(timespec="seconds"),
             }
             seen[str(item["id"])] = rec
@@ -622,20 +785,27 @@ def run(args: argparse.Namespace) -> int:
                 leftover.append(item)
                 continue
             fit = evaluate_listing(item, jd="", min_score=min_score)
+            term = evaluate_listing_term(item, jd="")
+            if not term.ok:
+                status, detail, score = "skipped_term", term.reason, fit.score
+            elif not fit.ok:
+                status, detail, score = "skipped_fit", fit.reason, fit.score
+            else:
+                status, detail, score = "dry_run", fit.reason, fit.score
             rec = {
                 "id": item["id"],
                 "company": item.get("company_name"),
                 "title": item.get("title"),
                 "url": item.get("url"),
-                "status": "dry_run" if fit.ok else "skipped_fit",
-                "fit": fit.score,
-                "detail": fit.reason,
+                "status": status,
+                "fit": score,
+                "detail": detail,
             }
             results.append(rec)
-            if fit.ok:
+            if status == "dry_run":
                 slots += 1
             else:
-                log(f"skip {item.get('company_name')} — {item.get('title')} ({fit.reason[:100]})")
+                log(f"skip {item.get('company_name')} — {item.get('title')} ({detail[:100]})")
         save_json(
             QUEUE_PATH,
             [
@@ -683,8 +853,15 @@ def run(args: argparse.Namespace) -> int:
         detail = ""
         fit_score = None
         try:
+            pre_term = evaluate_listing_term(item, jd="")
             pre = evaluate_listing(item, jd="", min_score=min_score)
-            if not pre.ok and pre.score < 0.25:
+            if not pre_term.ok:
+                log(f"skip {company} — {title} ({pre_term.reason[:120]})")
+                status = "skipped_term"
+                detail = pre_term.reason
+                fit_score = pre.score
+                slug = str(prev.get("slug") or "")
+            elif not pre.ok and pre.score < 0.25:
                 log(f"skip {company} — {title} ({pre.reason[:120]})")
                 status = "skipped_fit"
                 detail = pre.reason
@@ -708,14 +885,27 @@ def run(args: argparse.Namespace) -> int:
                 job_md = ROOT / "applications" / slug / "job.md"
                 fit = evaluate_listing(item, jd=jd_text, min_score=min_score)
                 fit_score = fit.score
-                if not fit.ok:
+                term = evaluate_listing_term(item, jd=jd_text)
+                if not term.ok:
+                    status = "skipped_term"
+                    detail = term.reason
+                    log(f"skip {company} — {title} ({term.reason[:120]})")
+                    slug = str(prev.get("slug") or "")
+                elif not fit.ok:
                     status = "skipped_fit"
                     detail = fit.reason
                     log(f"skip {company} — {title} ({fit.reason[:120]})")
                     slug = str(prev.get("slug") or "")
+                elif scraped.get("login_walled"):
+                    status = "scrape_failed"
+                    detail = "login wall"
+                    log(f"{status} applications/{slug}/ ({detail})")
                 else:
                     if jd_len >= MIN_JD_CHARS or not job_md.exists():
                         write_job_md(slug, item, scraped, copy_master=True)
+                    folder = ROOT / "applications" / slug
+                    if folder.is_dir():
+                        write_fit_json(folder, fit)
                     status = "scraped"
                     detail = scraped.get("error") or fit.reason
                     if do_tailor:
@@ -723,17 +913,16 @@ def run(args: argparse.Namespace) -> int:
                             status = "scrape_failed"
                             detail = detail or "no job.md after scrape"
                             log(f"{status} applications/{slug}/ ({detail[:120]})")
-                            slots += 1
                         elif jd_len < MIN_JD_CHARS and not _job_md_has_body(job_md):
                             status = "scrape_failed"
                             detail = detail or f"jd too short ({jd_len} chars)"
                             log(f"{status} applications/{slug}/ ({detail[:120]})")
-                            slots += 1
                         else:
                             try:
                                 ok, detail = tailor_with_cursor(slug, item, timeout)
                             except Exception as e:
                                 ok, detail = False, f"{type(e).__name__}: {e}"
+                            sync_fit_json(ROOT / "applications" / slug, min_score=min_score)
                             status = "tailored" if ok else "tailor_failed"
                             log(f"{status} applications/{slug}/ ({str(detail)[:120]})")
                             tidy_folder(ROOT / "applications" / slug)
@@ -745,7 +934,6 @@ def run(args: argparse.Namespace) -> int:
             status = "scrape_failed"
             detail = f"{type(e).__name__}: {e}"
             log(f"{status} applications/{slug}/ ({detail[:120]})")
-            slots += 1
         rec = {
             "id": lid,
             "company": company,
@@ -776,13 +964,14 @@ def run(args: argparse.Namespace) -> int:
 
     report = write_report(cfg, collect_today(seen), leftover, dry_run=False)
     run_cleanup(cfg, log=log)
+    filled = backfill_missing_fits(ROOT / "applications", min_score=min_score)
+    if filled:
+        log(f"wrote fit.json for {filled} existing application folders")
     tailored = sum(1 for r in results if r["status"] == "tailored")
-    skipped = sum(1 for r in results if r["status"] in {"skipped_fit", "skipped_duplicate"})
-    failed = sum(
-        1 for r in results if r["status"] not in {"tailored", "skipped_fit", "skipped_duplicate"}
-    )
+    skipped = sum(1 for r in results if r["status"] in SKIPPED_STATUSES)
+    failed = sum(1 for r in results if r["status"] not in {"tailored"} | SKIPPED_STATUSES)
     summary = (
-        f"{tailored} tailored, {skipped} skipped (fit/duplicate), {failed} failed, {len(leftover)} queued"
+        f"{tailored} tailored, {skipped} skipped (fit/duplicate/term), {failed} failed, {len(leftover)} queued"
     )
     log(summary)
     if cfg.get("notify") and (results or cfg.get("notify_if_empty")):

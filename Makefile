@@ -38,4 +38,4 @@ internships-dashboard:
 
 clean:
 	cd master && latexmk -C
-	@find applications -name '*.pdf' -o -name '*.aux' -o -name '*.log' -o -name '*.out' -o -name '*.fdb_latexmk' -o -name '*.fls' | xargs rm -f
+	@find applications \( -name '*.aux' -o -name '*.log' -o -name '*.out' -o -name '*.fdb_latexmk' -o -name '*.fls' -o -name '*.synctex.gz' \) -delete

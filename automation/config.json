@@ -31,8 +31,9 @@
   "tailor": true,
   "fit_min_score": 0.4,
   "retain_days": 21,
-  "retain_max_apps": 30,
+  "retain_max_apps": 400,
   "retain_reports_days": 14,
-  "dashboard_port": 8765,
-  "agent_timeout_s": 600
+    "dashboard_port": 8765,
+    "agent_timeout_s": 600,
+    "page_retries": 2
 }

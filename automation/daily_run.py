@@ -36,7 +36,8 @@ CHECK_SCRIPT = SCRAPE_DIR / "check_resume.py"
 
 sys.path.insert(0, str(SCRAPE_DIR))
 sys.path.insert(0, str(AUTO))
-from scrape_jd import MIN_JD_CHARS, scrape_one  # noqa: E402
+from check_resume import resume_ready, submit_pdf_name, submit_pdf_path  # noqa: E402
+from scrape_jd import MIN_JD_CHARS, jd_looks_like_posting, scrape_one  # noqa: E402
 from application_questions import (  # noqa: E402
     questions_look_real,
     questions_summary,
@@ -57,6 +58,17 @@ ANSWERS_NO_VISIBLE_BROWSER = (
     "If harvest_apply_form.py fails, hits a login wall, or hits a CAPTCHA, write "
     "the visible fields or None found and stop."
 )
+COVER_LETTER_NAME = "cover_letter.md"
+DEFAULT_PAGE_RETRIES = 2
+PAGE_OVERFLOW_RE = re.compile(r"PDF is (\d+) pages", re.I)
+TRANSIENT_AGENT_RE = re.compile(
+    r"ENOTFOUND|ECONNRESET|EAI_AGAIN|ETIMEDOUT|ECONNREFUSED|"
+    r"getaddrinfo|Connection lost|\[unavailable\]|"
+    r"RetriableError|socket hang up|network error|"
+    r"timed out after",
+    re.I,
+)
+RETRYABLE_KINDS = frozenset({"page", "format", "transient"})
 RETRY_STATUSES = frozenset({"tailor_failed", "scrape_failed"})
 SKIPPED_STATUSES = frozenset({"skipped_fit", "skipped_duplicate", "skipped_term"})
 NO_PDF_RETRY = frozenset({"tailored", "scraped", "skipped_duplicate"}) | RETRY_STATUSES
@@ -198,7 +210,16 @@ def _job_md_has_body(path: Path) -> bool:
     marker = "## Job description"
     idx = text.find(marker)
     body = text[idx + len(marker) :] if idx >= 0 else text
-    return len(body.strip()) >= MIN_JD_CHARS
+    return jd_looks_like_posting(body)
+
+
+def _folder_needs_work(folder: Path) -> bool:
+    """True when the application folder is missing a passing one-page resume or a real JD."""
+    ready, _ = resume_ready(folder)
+    if not ready:
+        return True
+    job = folder / "job.md"
+    return job.is_file() and not _job_md_has_body(job)
 
 
 def write_job_md(
@@ -206,6 +227,7 @@ def write_job_md(
     listing: dict[str, Any],
     scraped: dict[str, Any],
     copy_master: bool = True,
+    overwrite_answers: bool = True,
 ) -> Path:
     company = scraped.get("company") or listing.get("company_name") or "Unknown"
     role = scraped.get("role") or listing.get("title") or "Intern"
@@ -234,10 +256,11 @@ def write_job_md(
         encoding="utf-8",
     )
     answers = folder / "application_questions.md"
-    answers.write_text(
-        render_answers_md(str(company), str(role), str(url), questions),
-        encoding="utf-8",
-    )
+    if overwrite_answers or not answers.exists():
+        answers.write_text(
+            render_answers_md(str(company), str(role), str(url), questions),
+            encoding="utf-8",
+        )
     master = ROOT / "master" / "resume.tex"
     dest_tex = folder / "resume.tex"
     if copy_master and not dest_tex.exists():
@@ -269,7 +292,7 @@ def cursor_agent_argv() -> list[str] | None:
 
 
 def _needs_resume(rec: Any) -> bool:
-    """New listings, failures, and folders that lost resume.pdf should run again."""
+    """New listings, failures, chrome JDs, and folders that fail check_resume should run again."""
     if not isinstance(rec, dict):
         return True
     status = rec.get("status")
@@ -278,9 +301,185 @@ def _needs_resume(rec: Any) -> bool:
     if status == "skipped_overflow":
         return True
     slug = str(rec.get("slug") or "")
-    if slug and (ROOT / "applications" / slug / "resume.pdf").is_file():
-        return False
+    folder = ROOT / "applications" / slug if slug else None
+    if folder is not None and folder.is_dir():
+        return _folder_needs_work(folder)
     return status in NO_PDF_RETRY or not status
+
+
+def listing_from_folder(slug: str) -> dict[str, Any] | None:
+    """Rebuild a SimplifyJobs-like listing dict from applications/{slug}/job.md."""
+    folder = ROOT / "applications" / slug
+    job = folder / "job.md"
+    if not job.is_file():
+        return None
+    text = job.read_text(encoding="utf-8", errors="replace")
+    company, role = slug, "intern"
+    url = ""
+    lid = f"backfill-{slug}"
+    loc = ""
+    cat = ""
+    for line in text.splitlines():
+        if line.startswith("# "):
+            title = line[2:].strip()
+            if " — " in title:
+                company, role = title.split(" — ", 1)
+            else:
+                company = title
+        elif line.startswith("- ") and ":" in line:
+            key, val = line[2:].split(":", 1)
+            key, val = key.strip().lower(), val.strip()
+            if key == "source" and val.startswith("http"):
+                url = val
+            elif key == "listing id" and val:
+                lid = val
+            elif key == "location":
+                loc = val
+            elif key == "category":
+                cat = val
+    return {
+        "id": lid,
+        "company_name": company,
+        "title": role,
+        "url": url,
+        "locations": [loc] if loc else [],
+        "category": cat,
+    }
+
+
+def unready_application_slugs() -> list[str]:
+    apps = ROOT / "applications"
+    if not apps.is_dir():
+        return []
+    out: list[str] = []
+    for folder in sorted(apps.iterdir()):
+        if not folder.is_dir() or folder.name.startswith("."):
+            continue
+        if not (folder / "job.md").is_file():
+            continue
+        if _folder_needs_work(folder):
+            out.append(folder.name)
+    return out
+
+
+def backfill_unready(
+    cfg: dict[str, Any],
+    seen: dict[str, Any],
+    timeout: int,
+    max_n: int,
+    already: set[str],
+    results: list[dict[str, Any]],
+) -> int:
+    """Tailor applications/ folders that still lack a passing one-page resume."""
+    if max_n <= 0:
+        return 0
+    do_tailor = bool(cfg.get("tailor", True))
+    used = 0
+    for slug in unready_application_slugs():
+        if used >= max_n:
+            break
+        if slug in already:
+            continue
+        listing = listing_from_folder(slug)
+        if not listing:
+            continue
+        company = str(listing.get("company_name") or "company")
+        title = str(listing.get("title") or "intern")
+        url = str(listing.get("url") or "")
+        lid = str(listing.get("id") or f"backfill-{slug}")
+        job_md = ROOT / "applications" / slug / "job.md"
+        chrome = not _job_md_has_body(job_md)
+        if chrome and url:
+            log(f"backfill scrape {company} — {title}")
+            try:
+                scraped = scrape_one(url, browser=True)
+            except Exception as e:
+                scraped = {
+                    "ok": False,
+                    "error": f"{type(e).__name__}: {e}",
+                    "jd_text": "",
+                    "questions": [],
+                }
+            scraped["company"] = company
+            scraped["role"] = title
+            jd_text = (scraped.get("jd_text") or "").strip()
+            if jd_looks_like_posting(jd_text):
+                write_job_md(
+                    slug,
+                    listing,
+                    scraped,
+                    copy_master=False,
+                    overwrite_answers=False,
+                )
+                chrome = False
+            else:
+                log(f"backfill still chrome applications/{slug}/")
+        if chrome:
+            rec = {
+                "id": lid,
+                "company": company,
+                "title": title,
+                "url": url,
+                "slug": slug,
+                "status": "scrape_failed",
+                "detail": "jd is site chrome",
+                "at": datetime.now().isoformat(timespec="seconds"),
+            }
+            seen[lid] = rec
+            results.append(rec)
+            save_json(SEEN_PATH, seen)
+            continue
+        folder = ROOT / "applications" / slug
+        ready, _ = resume_ready(folder)
+        if ready:
+            log(f"backfill refreshed JD applications/{slug}/")
+            already.add(slug)
+            continue
+        if not do_tailor:
+            continue
+        log(f"backfill tailor applications/{slug}/")
+        try:
+            ok, detail = tailor_with_cursor(slug, listing, timeout)
+        except Exception as e:
+            ok, detail = False, f"{type(e).__name__}: {e}"
+        status = "tailored" if ok else "tailor_failed"
+        rec = {
+            "id": lid,
+            "company": company,
+            "title": title,
+            "url": url,
+            "slug": slug,
+            "status": status,
+            "detail": str(detail)[:400],
+            "at": datetime.now().isoformat(timespec="seconds"),
+        }
+        seen[lid] = rec
+        results.append({**rec, "detail": str(detail)[:500]})
+        save_json(SEEN_PATH, seen)
+        tidy_folder(ROOT / "applications" / slug)
+        log(f"{status} applications/{slug}/ ({str(detail)[:120]})")
+        used += 1
+        already.add(slug)
+    return used
+
+
+def is_page_overflow(msg: str) -> bool:
+    """True when check_resume.py reported a PDF that is not exactly one page."""
+    m = PAGE_OVERFLOW_RE.search(msg or "")
+    return bool(m) and int(m.group(1)) != 1
+
+
+def is_transient_agent_error(msg: str) -> bool:
+    """Cursor CLI DNS / disconnect / timeout that is worth one more try."""
+    return bool(TRANSIENT_AGENT_RE.search(msg or ""))
+
+
+def page_retries() -> int:
+    try:
+        n = int((load_config() or {}).get("page_retries", DEFAULT_PAGE_RETRIES))
+    except (TypeError, ValueError, OSError, json.JSONDecodeError):
+        n = DEFAULT_PAGE_RETRIES
+    return max(0, min(n, 5))
 
 
 def reset_resume_tex(slug: str) -> None:
@@ -443,37 +642,55 @@ def format_check_resume(slug: str) -> tuple[bool, str]:
     return proc.returncode == 0, msg
 
 
-def _tailor_phase(
+def _resume_task(folder: str, *, fix_hint: str) -> str:
+    check = (
+        f"python3 .cursor/skills/tailor-resume/scripts/check_resume.py {folder}"
+    )
+    pdf_name = submit_pdf_name()
+    submit = f"{folder}/{pdf_name}"
+    copy_cmd = f"cp resume.pdf {pdf_name}"
+    if fix_hint:
+        return (
+            f"HARD FAIL from {check} (Python already measured the PDF; this is not optional):\n"
+            f"{fix_hint}\n"
+            f"Do not copy master/resume.tex again. Edit the current {folder}/resume.tex only. "
+            "Follow the skill's One-page trim order. Recompile with "
+            "latexmk -pdf -interaction=nonstopmode resume.tex, then "
+            f"{copy_cmd}. The submit file is {submit} (First_Last_resume.pdf). "
+            "Run the same check_resume.py again. "
+            "Repeat until it prints OK. Do not add content. Do not open a browser."
+        )
+    return (
+        f"Copy of master is at {folder}/resume.tex (already reset). Tailor that resume.tex only. "
+        "Compile with latexmk -pdf -interaction=nonstopmode resume.tex in that folder, then "
+        f"{copy_cmd}. The submit file is {submit} "
+        "(First_Last_resume.pdf from profile.json first_name and last_name). "
+        "Keep resume.tex as the source name. Do not leave the submit PDF named resume.pdf. "
+        f"Run {check} and fix until it prints OK "
+        "(heading/date collision, GPU names duplicated in heading and bullets, page count). "
+        "Then latexmk -c (lowercase) to drop aux files. Do not run latexmk -C; that deletes the latexmk PDF. "
+        "Keep exactly one FULL page. Python will reject any PDF that is not exactly one page and "
+        "re-run this step. "
+        "Keep high school on by default (master already fills one page with it). Drop HS only if the PDF overflows to two pages after keyword edits. "
+        "If you drop high school, fill the space from master/bank.md (extra bullets, courses, JD keywords). "
+        "A short sparse one-pager is a failed tailor. Match as many true JD keywords as possible. "
+        "Do not open a browser or harvest the apply form in this step."
+    )
+
+
+def _tailor_prompt(
     slug: str,
     listing: dict[str, Any],
-    timeout: int,
+    folder: str,
     *,
     do_resume: bool,
     do_answers: bool,
-) -> tuple[bool, str]:
-    argv = cursor_agent_argv()
-    if not argv:
-        return False, (
-            "Cursor Agent CLI not found. Install it with: "
-            "curl https://cursor.com/install -fsS | bash"
-        )
-    folder = f"applications/{slug}"
+    do_cover: bool,
+    fix_hint: str = "",
+) -> str:
+    tasks: list[str] = []
     if do_resume:
-        reset_resume_tex(slug)
-    tasks = []
-    if do_resume:
-        tasks.append(
-            f"Copy of master is at {folder}/resume.tex (already reset). Tailor that resume.tex only. "
-            "Compile with latexmk -pdf -interaction=nonstopmode in that folder. The submit file is "
-            f"{folder}/resume.pdf. Run python3 .cursor/skills/tailor-resume/scripts/check_resume.py "
-            f"{folder} and fix until it prints OK (heading/date collision, GPU names duplicated in heading and bullets, page count). "
-            "Then latexmk -c (lowercase) to drop aux files. Do not run latexmk -C; that deletes resume.pdf. "
-            "Keep exactly one FULL page. "
-            "Keep high school on by default (master already fills one page with it). Drop HS only if the PDF overflows to two pages after keyword edits. "
-            "If you drop high school, fill the space from master/bank.md (extra bullets, courses, JD keywords). "
-            "A short sparse one-pager is a failed tailor. Match as many true JD keywords as possible. "
-            "Do not open a browser or harvest the apply form in this step."
-        )
+        tasks.append(_resume_task(folder, fix_hint=fix_hint))
     if do_answers:
         tasks.append(
             f"Rewrite {folder}/application_questions.md with every apply-form question you can get "
@@ -485,19 +702,46 @@ def _tailor_phase(
             "Fill each answer from master/resume.tex, master/bank.md, "
             "and .cursor/skills/tailor-resume/profile.json only. Replace DRAFT / Needs user only when "
             "those files have the fact; otherwise leave Needs user. Never invent facts. "
-            "Follow .cursor/skills/tailor-resume/writing.md for cover letters and essays: creative, "
-            "novel-like, off-resume material, no citizenship/relocation in letters, no em dashes, "
-            "avoid colons in prose, points must flow (not a three-job sandwich). "
+            "Follow .cursor/skills/tailor-resume/writing.md for cover letters and essays: personal "
+            "and realistic in depth, one bank scene with cause and effect, off-resume material, "
+            "no citizenship/relocation in letters, no em dashes, avoid colons in prose, points "
+            "must flow (not a three-job sandwich). "
             "Do not skip questions even if the first HTTP scrape found none."
         )
-    if do_resume and not do_answers:
+    if do_cover:
+        tasks.append(
+            f"Write {folder}/{COVER_LETTER_NAME} for this role. Follow "
+            ".cursor/skills/tailor-resume/writing.md. About 220-380 words (aim near 300). "
+            "Read master/bank.md Voice and stories first. Pick one personal bank scene that "
+            "overlaps this team and sit in it with cause and effect (what you noticed, why you "
+            "did not trust it, what you did next, how it felt). Include a concrete object from "
+            "the bank. Name something specific this team ships, from the JD, in your own words. "
+            "Realistic intern voice, not novel-like or cinematic. Off-resume material. Do not "
+            "recap metrics already on the tailored resume. Read the resume only so the letter "
+            "does not repeat it. Do not mention citizenship, visa, sponsorship, relocation, or "
+            "being available full-time / on-site. No em dashes, no colon-lists, no stacked punchy "
+            "short sentences. Greeting may be Dear Team,. Sign with the name from "
+            ".cursor/skills/tailor-resume/profile.json. Never invent facts. "
+            "Do not harvest the apply form in this step."
+        )
+    if not do_answers:
         tasks.append(f"Do not rewrite {folder}/application_questions.md.")
-    if do_answers and not do_resume:
+    if not do_resume:
         tasks.append(
             f"Do not edit {folder}/resume.tex, do not compile, and do not run latexmk. "
-            "Leave resume.pdf untouched."
+            f"Leave {submit_pdf_name()} untouched."
         )
-    prompt = f"""Follow .cursor/skills/tailor-resume/SKILL.md exactly. Do not edit master/resume.tex.
+    if not do_cover:
+        tasks.append(f"Do not write or rewrite {folder}/{COVER_LETTER_NAME}.")
+    resume_rules = ""
+    if do_resume:
+        resume_rules = (
+            "Keep Education at the top. Keep jobs and projects reverse chronological. "
+            "You may reorder the Technical Skills, Experience, and Projects sections as whole blocks.\n"
+            "Degree line: leave showmolbio off (Bachelor of Science in Computer Science) unless the role itself is biology, biotech, computational biology, genomics, or wet lab. A SWE/ML intern seat at a pharma company is not enough; do not print Molecular Biology on those.\n"
+            "If this role is AI Engineer, ML Engineer, LLM, GenAI, or similar, apply the skill's AI / ML pack in full (heavy). Do not leave the master default.\n"
+        )
+    return f"""Follow .cursor/skills/tailor-resume/SKILL.md exactly. Do not edit master/resume.tex.
 
 Company: {listing.get('company_name')}
 Role: {listing.get('title')}
@@ -505,31 +749,36 @@ URL: {listing.get('url')}
 Slug: {slug}
 
 The JD is already at {folder}/job.md.
-Keep Education at the top. Keep jobs and projects reverse chronological. You may reorder the Technical Skills, Experience, and Projects sections as whole blocks.
-Degree line: leave showmolbio off (Bachelor of Science in Computer Science) unless the role itself is biology, biotech, computational biology, genomics, or wet lab. A SWE/ML intern seat at a pharma company is not enough; do not print Molecular Biology on those.
-If this role is AI Engineer, ML Engineer, LLM, GenAI, or similar, apply the skill's AI / ML pack in full (heavy). Do not leave the master default.
-{chr(10).join('- ' + t for t in tasks)}
+{resume_rules}{chr(10).join('- ' + t for t in tasks)}
 Never invent facts.
 Reply with the changelog format from the skill, nothing else.
 """
-    cmd = [
-        *argv,
-        "-p",
-        "--force",
-        "--trust",
-        "--sandbox",
-        "disabled",
-        "--workspace",
-        str(ROOT),
-        "--output-format",
-        "text",
-        prompt,
-    ]
+
+
+def _tailor_phase(
+    slug: str,
+    listing: dict[str, Any],
+    timeout: int,
+    *,
+    do_resume: bool,
+    do_answers: bool,
+    do_cover: bool = False,
+) -> tuple[bool, str]:
+    argv = cursor_agent_argv()
+    if not argv:
+        return False, (
+            "Cursor Agent CLI not found. Install it with: "
+            "curl https://cursor.com/install -fsS | bash"
+        )
+    folder = f"applications/{slug}"
     env = os.environ.copy()
     answers = ROOT / "applications" / slug / "application_questions.md"
     answers_mtime = answers.stat().st_mtime if answers.is_file() else 0.0
-    code, out, timed_out = run_agent_cmd(cmd, timeout, str(ROOT), env, slug=slug)
-    pdf = ROOT / "applications" / slug / "resume.pdf"
+    cover = ROOT / "applications" / slug / COVER_LETTER_NAME
+    cover_mtime = cover.stat().st_mtime if cover.is_file() else 0.0
+
+    def _pdf() -> Path:
+        return submit_pdf_path(ROOT / "applications" / slug, promote=True)
 
     def _answers_rewritten() -> bool:
         if not answers.is_file():
@@ -537,38 +786,114 @@ Reply with the changelog format from the skill, nothing else.
         if answers.stat().st_mtime < answers_mtime + 0.05:
             return False
         return len(answers.read_text(encoding="utf-8", errors="replace")) > 80
-    auth_fail = (
-        "not logged in" in out.lower()
-        or "not authenticated" in out.lower()
-        or "authentication required" in out.lower()
-        or "unauthorized" in out.lower()
-    )
-    if auth_fail:
-        return False, (
-            "Cursor Agent CLI is not logged in. In a terminal run: agent login"
-            "  (or set CURSOR_API_KEY from https://cursor.com/dashboard/api)"
+
+    def _cover_rewritten() -> bool:
+        if not cover.is_file():
+            return False
+        if cover.stat().st_mtime < cover_mtime + 0.05:
+            return False
+        return len(cover.read_text(encoding="utf-8", errors="replace")) > 80
+
+    def _run_once(fix_hint: str) -> tuple[int | None, str, bool]:
+        prompt = _tailor_prompt(
+            slug,
+            listing,
+            folder,
+            do_resume=do_resume,
+            do_answers=do_answers,
+            do_cover=do_cover,
+            fix_hint=fix_hint,
         )
-    tail = out[-2000:]
-    if timed_out:
-        if do_resume and pdf.exists():
-            ok_fmt, fmt = format_check_resume(slug)
-            if not ok_fmt:
-                return False, fmt or tail or "format check failed"
-            return True, tail or f"timed out after {timeout}s but PDF exists"
-        if do_answers and not do_resume:
+        cmd = [
+            *argv,
+            "-p",
+            "--force",
+            "--trust",
+            "--sandbox",
+            "disabled",
+            "--workspace",
+            str(ROOT),
+            "--output-format",
+            "text",
+            prompt,
+        ]
+        return run_agent_cmd(cmd, timeout, str(ROOT), env, slug=slug)
+
+    def _interpret(
+        code: int | None, out: str, timed_out: bool
+    ) -> tuple[bool, str, str]:
+        """Return (ok, detail, retry_kind). retry_kind is page/format/transient or ''."""
+        auth_fail = (
+            "not logged in" in out.lower()
+            or "not authenticated" in out.lower()
+            or "authentication required" in out.lower()
+            or "unauthorized" in out.lower()
+        )
+        if auth_fail:
+            return (
+                False,
+                "Cursor Agent CLI is not logged in. In a terminal run: agent login"
+                "  (or set CURSOR_API_KEY from https://cursor.com/dashboard/api)",
+                "",
+            )
+        tail = out[-2000:]
+        if timed_out:
+            if do_resume and _pdf().is_file():
+                ok_fmt, fmt = format_check_resume(slug)
+                if ok_fmt:
+                    return True, tail or f"timed out after {timeout}s but PDF exists", ""
+                kind = "page" if is_page_overflow(fmt) else "format"
+                return False, fmt or tail or "format check failed", kind
+            if do_answers and not do_resume and _answers_rewritten():
+                return True, tail or f"timed out after {timeout}s but answers exist", ""
+            if do_cover and not do_resume and not do_answers and _cover_rewritten():
+                return True, tail or f"timed out after {timeout}s but cover letter exists", ""
+            return False, tail or f"cursor agent timed out after {timeout}s", "transient"
+        if do_resume:
+            if _pdf().is_file():
+                ok_fmt, fmt = format_check_resume(slug)
+                if ok_fmt:
+                    return True, tail, ""
+                kind = "page" if is_page_overflow(fmt) else "format"
+                return False, fmt or "format check failed", kind
+            kind = "transient" if is_transient_agent_error(out) else ""
+            return False, tail or f"cursor agent exit {code} (no PDF)", kind
+        if do_answers:
             if _answers_rewritten():
-                return True, tail or f"timed out after {timeout}s but answers exist"
-        return False, tail or f"cursor agent timed out after {timeout}s"
+                return True, tail, ""
+            kind = "transient" if is_transient_agent_error(out) else ""
+            return False, tail or f"cursor agent exit {code}", kind
+        if do_cover and _cover_rewritten():
+            return True, tail, ""
+        kind = "transient" if is_transient_agent_error(out) else ""
+        return False, tail or f"cursor agent exit {code}", kind
+
     if do_resume:
-        if pdf.exists():
-            ok_fmt, fmt = format_check_resume(slug)
-            if not ok_fmt:
-                return False, fmt or "format check failed"
-            return True, tail
-        return False, tail or f"cursor agent exit {code} (no PDF)"
-    if _answers_rewritten():
-        return True, tail
-    return False, tail or f"cursor agent exit {code}"
+        reset_resume_tex(slug)
+
+    extra = page_retries() if do_resume else 1
+    attempts = 1 + extra
+    hint = ""
+    last_detail = "no attempt"
+    last_kind = ""
+    for i in range(attempts):
+        if i:
+            why = "agent error" if last_kind == "transient" else "resume check failed"
+            log(f"{slug}: {why}; retry {i}/{attempts - 1}")
+            if last_kind == "transient" and do_resume and not _pdf().is_file():
+                reset_resume_tex(slug)
+                hint = ""
+        code, out, timed_out = _run_once(hint)
+        ok, detail, retry_kind = _interpret(code, out, timed_out)
+        last_detail = detail
+        last_kind = retry_kind
+        if ok:
+            return True, detail
+        if retry_kind not in RETRYABLE_KINDS:
+            return False, detail
+        if retry_kind in {"page", "format"}:
+            hint = detail
+    return False, last_detail
 
 
 def tailor_with_cursor(
@@ -578,9 +903,10 @@ def tailor_with_cursor(
     *,
     do_resume: bool = True,
     do_answers: bool = True,
+    do_cover: bool = False,
     on_start: Any | None = None,
 ) -> tuple[bool, str]:
-    if not do_resume and not do_answers:
+    if not do_resume and not do_answers and not do_cover:
         return False, "nothing to generate"
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     lock_fh = TAILOR_LOCK_PATH.open("w")
@@ -589,26 +915,83 @@ def tailor_with_cursor(
         with _TAILOR_SLOT:
             if on_start:
                 on_start()
-            if do_resume and do_answers:
-                ok_r, det_r = _tailor_phase(
-                    slug, listing, timeout, do_resume=True, do_answers=False
-                )
-                if not (ROOT / "applications" / slug).is_dir():
-                    return False, det_r or "application folder deleted"
-                if not ok_r:
-                    return False, det_r
-                ok_a, det_a = _tailor_phase(
-                    slug, listing, timeout, do_resume=False, do_answers=True
-                )
-                if ok_a:
-                    return True, det_a or det_r
-                return True, f"resume ok; answers failed: {det_a}"
-            return _tailor_phase(
-                slug, listing, timeout, do_resume=do_resume, do_answers=do_answers
+            return _run_tailor_phases(
+                slug,
+                listing,
+                timeout,
+                do_resume=do_resume,
+                do_answers=do_answers,
+                do_cover=do_cover,
             )
     finally:
         fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
         lock_fh.close()
+
+
+def _run_tailor_phases(
+    slug: str,
+    listing: dict[str, Any],
+    timeout: int,
+    *,
+    do_resume: bool,
+    do_answers: bool,
+    do_cover: bool,
+) -> tuple[bool, str]:
+    folder = ROOT / "applications" / slug
+
+    def run_phase(*, resume: bool, answers: bool, cover: bool) -> tuple[bool, str]:
+        return _tailor_phase(
+            slug,
+            listing,
+            timeout,
+            do_resume=resume,
+            do_answers=answers,
+            do_cover=cover,
+        )
+
+    notes: list[str] = []
+    resume_ok = False
+    if do_resume:
+        ok_r, det_r = run_phase(resume=True, answers=False, cover=False)
+        if not folder.is_dir():
+            return False, det_r or "application folder deleted"
+        if not ok_r:
+            return False, det_r
+        resume_ok = True
+        notes.append(det_r)
+    if do_answers:
+        ok_a, det_a = run_phase(resume=False, answers=True, cover=False)
+        if not folder.is_dir():
+            return False, det_a or "application folder deleted"
+        if ok_a:
+            notes.append(det_a)
+        elif resume_ok or do_cover:
+            notes.append(f"answers failed: {det_a}")
+        else:
+            return False, det_a
+    if do_cover:
+        ok_c, det_c = run_phase(resume=False, answers=False, cover=True)
+        if not folder.is_dir():
+            return False, det_c or "application folder deleted"
+        if ok_c:
+            notes.append(det_c)
+        elif resume_ok:
+            notes.append(f"cover failed: {det_c}")
+        else:
+            failed_only = all("failed:" in n for n in notes) if notes else True
+            if failed_only:
+                return False, det_c
+            notes.append(f"cover failed: {det_c}")
+    failed = [n for n in notes if "failed:" in n]
+    if resume_ok:
+        if failed:
+            return True, "resume ok; " + "; ".join(failed)
+        return True, notes[-1] if notes else "ok"
+    if failed and len(failed) == len(notes):
+        return False, failed[-1]
+    if failed:
+        return True, "; ".join(notes)
+    return True, notes[-1] if notes else "ok"
 
 
 def notify(title: str, body: str) -> None:
@@ -643,6 +1026,11 @@ def main() -> int:
     )
     parser.add_argument("--cleanup", action="store_true", help="prune old applications/logs/reports and exit")
     parser.add_argument("--dashboard", action="store_true", help="open the local internship dashboard")
+    parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help="tailor any applications/ folder missing a passing one-page resume; skip SimplifyJobs fetch",
+    )
     parser.add_argument(
         "--daemon",
         action="store_true",
@@ -682,10 +1070,15 @@ def rebuild_report() -> int:
 def run(args: argparse.Namespace) -> int:
     cfg = load_config()
     max_n = args.max if args.max is not None else int(cfg.get("max_per_day") or 10)
-    listings = fetch_listings(cfg["listings_url"])
-    matched = [x for x in listings if matches(x, cfg)]
-    matched.sort(key=lambda x: int(x.get("date_posted") or 0), reverse=True)
-    log(f"fetched {len(listings)} listings, {len(matched)} match filters")
+    if getattr(args, "backfill", False):
+        listings = []
+        matched = []
+        log("backfill-only: skip SimplifyJobs fetch")
+    else:
+        listings = fetch_listings(cfg["listings_url"])
+        matched = [x for x in listings if matches(x, cfg)]
+        matched.sort(key=lambda x: int(x.get("date_posted") or 0), reverse=True)
+        log(f"fetched {len(listings)} listings, {len(matched)} match filters")
 
     seen: dict[str, Any] = load_json(SEEN_PATH, {})
     first_run = not bool(seen)
@@ -824,7 +1217,8 @@ def run(args: argparse.Namespace) -> int:
 
     timeout = int(cfg.get("agent_timeout_s") or cfg.get("claude_timeout_s") or 600)
     do_tailor = bool(cfg.get("tailor", True))
-    if do_tailor and queue:
+    unready = unready_application_slugs() if do_tailor and not args.dry_run else []
+    if do_tailor and (queue or unready):
         argv = cursor_agent_argv()
         if not argv:
             log("Cursor Agent CLI not found; install with: curl https://cursor.com/install -fsS | bash")
@@ -913,9 +1307,15 @@ def run(args: argparse.Namespace) -> int:
                             status = "scrape_failed"
                             detail = detail or "no job.md after scrape"
                             log(f"{status} applications/{slug}/ ({detail[:120]})")
-                        elif jd_len < MIN_JD_CHARS and not _job_md_has_body(job_md):
+                        elif not jd_looks_like_posting(jd_text) and not _job_md_has_body(job_md):
                             status = "scrape_failed"
-                            detail = detail or f"jd too short ({jd_len} chars)"
+                            err = str(scraped.get("error") or "")
+                            if err == "chrome":
+                                detail = "jd is site chrome"
+                            elif err == "too_short" or jd_len < MIN_JD_CHARS:
+                                detail = f"jd too short ({jd_len} chars)"
+                            else:
+                                detail = detail or f"jd is site chrome ({jd_len} chars)"
                             log(f"{status} applications/{slug}/ ({detail[:120]})")
                         else:
                             try:
@@ -948,6 +1348,14 @@ def run(args: argparse.Namespace) -> int:
         seen[lid] = rec
         save_json(SEEN_PATH, seen)
         results.append({**rec, "detail": str(detail)[:500]})
+
+    if do_tailor and not args.dry_run:
+        remaining = max_n - slots
+        already = {str(r.get("slug") or "") for r in results if r.get("slug")}
+        filled_slots = backfill_unready(cfg, seen, timeout, remaining, already, results)
+        if filled_slots:
+            log(f"backfill tailored {filled_slots} existing application folder(s)")
+            slots += filled_slots
 
     save_json(
         QUEUE_PATH,

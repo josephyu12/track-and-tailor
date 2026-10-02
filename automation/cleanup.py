@@ -2,11 +2,14 @@
 """Keep application folders from growing without bound.
 
 Policy (see config retain_*):
-- Always strip LaTeX aux files and extra PDFs; never delete resume.pdf
+- Always strip LaTeX aux files and extra PDFs; never delete First_Last_resume.pdf
+- Promote latexmk's resume.pdf to First_Last_resume.pdf (profile.json names)
 - Delete empty leftover folders (no job.md and no submit PDF)
 - Keep failed-tailor folders that still have job.md so retry/dashboard do not 404
 - Delete folders older than retain_days unless they contain `.keep`
-- If still over retain_max_apps, delete oldest non-`.keep` folders
+- If unpinned folders still exceed retain_max_apps, drop oldest complete
+  one-page resumes. Folders that still need a passing resume (job.md without
+  a check_resume-OK PDF) and `.keep` never count toward the cap.
 - Rotate reports and daily.log
 - Compact seeded rows in seen.json
 """
@@ -14,6 +17,8 @@ Policy (see config retain_*):
 from __future__ import annotations
 
 import json
+import shutil
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +29,10 @@ APPS = ROOT / "applications"
 REPORTS = ROOT / "automation" / "reports"
 LOGS = ROOT / "automation" / "logs"
 SEEN = ROOT / "automation" / "state" / "seen.json"
+SCRAPE = ROOT / ".cursor" / "skills" / "tailor-resume" / "scripts"
+
+sys.path.insert(0, str(SCRAPE))
+from check_resume import resume_ready, submit_pdf_name, submit_pdf_path  # noqa: E402
 
 AUX_SUFFIXES = {".aux", ".log", ".out", ".fdb_latexmk", ".fls", ".synctex.gz", ".toc"}
 KEEP_NAME = ".keep"
@@ -37,11 +46,15 @@ def _mtime(path: Path) -> float:
 
 
 def tidy_folder(folder: Path) -> list[str]:
-    """Remove compile junk and extra PDFs. Keep resume.pdf + sources."""
+    """Remove compile junk and extra PDFs. Keep First_Last_resume.pdf + sources."""
     removed: list[str] = []
     if not folder.is_dir():
         return removed
-    submit = folder / "resume.pdf"
+    named = folder / submit_pdf_name()
+    legacy = folder / "resume.pdf"
+    if not named.is_file() and legacy.is_file():
+        shutil.copy2(legacy, named)
+    submit = named if named.is_file() else legacy
     for path in list(folder.iterdir()):
         if not path.is_file():
             continue
@@ -49,10 +62,22 @@ def tidy_folder(folder: Path) -> list[str]:
             path.unlink(missing_ok=True)
             removed.append(path.name)
             continue
-        if path.suffix.lower() == ".pdf" and path.name != "resume.pdf" and submit.is_file():
+        if (
+            path.suffix.lower() == ".pdf"
+            and path.name != submit.name
+            and submit.is_file()
+        ):
             path.unlink(missing_ok=True)
             removed.append(path.name)
     return removed
+
+
+def keep_unready_from_cap(folder: Path) -> bool:
+    """True when the folder still needs a passing one-page resume (do not cap-delete)."""
+    if not (folder / "job.md").is_file():
+        return False
+    ready, _ = resume_ready(folder)
+    return not ready
 
 
 def is_stub(folder: Path) -> bool:
@@ -64,7 +89,7 @@ def is_stub(folder: Path) -> bool:
     """
     if (folder / KEEP_NAME).exists():
         return False
-    if (folder / "resume.pdf").exists():
+    if submit_pdf_path(folder).is_file():
         return False
     if (folder / "job.md").is_file():
         return False
@@ -107,12 +132,15 @@ def prune_applications(
 
     aged.sort(key=lambda pair: pair[0])
     kept = [p for _, p in aged]
-    while len(kept) > retain_max:
-        victims = [p for p in kept if not (p / KEEP_NAME).exists()]
-        if not victims:
+    while True:
+        victims = [
+            p
+            for p in kept
+            if not (p / KEEP_NAME).exists() and not keep_unready_from_cap(p)
+        ]
+        if len(victims) <= retain_max:
             break
-        no_pdf = [p for p in victims if not (p / "resume.pdf").is_file()]
-        folder = (no_pdf or victims)[0]
+        folder = victims[0]
         _rmtree(folder)
         kept.remove(folder)
         stats["capped"] += 1
@@ -186,7 +214,7 @@ def _rmtree(folder: Path) -> None:
 
 def run_cleanup(cfg: dict[str, Any], log: Callable[[str], None] | None = None) -> dict[str, int]:
     retain_days = int(cfg.get("retain_days") or 21)
-    retain_max = int(cfg.get("retain_max_apps") or 30)
+    retain_max = int(cfg.get("retain_max_apps") or 400)
     report_days = int(cfg.get("retain_reports_days") or 14)
     stats = prune_applications(retain_days, retain_max, log=log)
     prune_reports(report_days, log=log)

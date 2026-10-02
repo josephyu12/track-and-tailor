@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cleanup import is_stub, prune_applications  # noqa: E402
+from test_check_resume import pdf_bytes  # noqa: E402
 
 
 class StubPolicy(unittest.TestCase):
@@ -60,27 +61,57 @@ class StubPolicy(unittest.TestCase):
         self.assertTrue(folder.exists())
         self.assertEqual(stats["stubs"], 0)
 
-    def test_tidy_keeps_resume_pdf_and_drops_extra_pdf(self) -> None:
+    def test_tidy_promotes_named_resume_and_drops_extra_pdf(self) -> None:
+        from check_resume import submit_pdf_name
+        from cleanup import tidy_folder
+
+        folder = self._folder("acme-swe")
+        named = submit_pdf_name()
+        (folder / "resume.pdf").write_bytes(b"%PDF-latexmk")
+        (folder / "extra.pdf").write_bytes(b"%PDF")
+        (folder / "resume.aux").write_text("aux\n", encoding="utf-8")
+        removed = tidy_folder(folder)
+        self.assertTrue((folder / named).is_file())
+        self.assertEqual((folder / named).read_bytes(), b"%PDF-latexmk")
+        self.assertFalse((folder / "resume.pdf").exists())
+        self.assertFalse((folder / "extra.pdf").exists())
+        self.assertFalse((folder / "resume.aux").exists())
+        self.assertIn("resume.pdf", removed)
+        self.assertIn("extra.pdf", removed)
+        self.assertIn("resume.aux", removed)
+        self.assertNotIn(named, removed)
+
+    def test_tidy_keeps_existing_named_pdf(self) -> None:
+        from check_resume import submit_pdf_name
+        from cleanup import tidy_folder
+
+        folder = self._folder("acme-swe")
+        named = submit_pdf_name()
+        (folder / "resume.pdf").write_bytes(b"%PDF-latexmk")
+        (folder / named).write_bytes(b"%PDF-submit")
+        removed = tidy_folder(folder)
+        self.assertEqual((folder / named).read_bytes(), b"%PDF-submit")
+        self.assertFalse((folder / "resume.pdf").exists())
+        self.assertIn("resume.pdf", removed)
+        self.assertNotIn(named, removed)
+
+    def test_tidy_keeps_cover_letter_md(self) -> None:
         from cleanup import tidy_folder
 
         folder = self._folder("acme-swe")
         (folder / "resume.pdf").write_bytes(b"%PDF-submit")
-        (folder / "Joseph_Yu_resume.pdf").write_bytes(b"%PDF-copy")
-        (folder / "resume.aux").write_text("aux\n", encoding="utf-8")
+        (folder / "cover_letter.md").write_text("Dear Team,\n", encoding="utf-8")
+        (folder / "extra.pdf").write_bytes(b"%PDF")
         removed = tidy_folder(folder)
-        self.assertTrue((folder / "resume.pdf").is_file())
-        self.assertEqual((folder / "resume.pdf").read_bytes(), b"%PDF-submit")
-        self.assertFalse((folder / "Joseph_Yu_resume.pdf").exists())
-        self.assertFalse((folder / "resume.aux").exists())
-        self.assertIn("Joseph_Yu_resume.pdf", removed)
-        self.assertIn("resume.aux", removed)
-        self.assertNotIn("resume.pdf", removed)
+        self.assertTrue((folder / "cover_letter.md").is_file())
+        self.assertFalse((folder / "extra.pdf").exists())
+        self.assertNotIn("cover_letter.md", removed)
 
-    def test_prune_caps_missing_pdf_before_complete(self) -> None:
+    def test_prune_does_not_cap_unready_job(self) -> None:
         old = time.time() - 400
         complete = self._folder("has-pdf")
         (complete / "job.md").write_text("# Co — Role\n", encoding="utf-8")
-        (complete / "resume.pdf").write_bytes(b"%PDF")
+        (complete / "resume.pdf").write_bytes(pdf_bytes(1))
         os.utime(complete, (old, old))
         missing = self._folder("no-pdf")
         (missing / "job.md").write_text("# Co2 — Role\n", encoding="utf-8")
@@ -88,7 +119,60 @@ class StubPolicy(unittest.TestCase):
         with patch("cleanup.APPS", self.apps):
             stats = prune_applications(21, 1, now=datetime.now())
         self.assertTrue(complete.is_dir())
-        self.assertFalse(missing.exists())
+        self.assertTrue(missing.is_dir())
+        self.assertEqual(stats["capped"], 0)
+
+    def test_prune_cap_drops_oldest_complete_keeps_unready(self) -> None:
+        old = time.time() - 400
+        older = self._folder("older-job")
+        (older / "job.md").write_text("# Old — Role\n", encoding="utf-8")
+        (older / "resume.pdf").write_bytes(pdf_bytes(1))
+        os.utime(older, (old, old))
+        newer = self._folder("newer-job")
+        (newer / "job.md").write_text("# New — Role\n", encoding="utf-8")
+        (newer / "resume.pdf").write_bytes(pdf_bytes(1))
+        os.utime(newer, (old + 10, old + 10))
+        missing = self._folder("no-pdf")
+        (missing / "job.md").write_text("# Pending — Role\n", encoding="utf-8")
+        os.utime(missing, (old + 20, old + 20))
+        with patch("cleanup.APPS", self.apps):
+            stats = prune_applications(21, 1, now=datetime.now())
+        self.assertFalse(older.exists())
+        self.assertTrue(newer.is_dir())
+        self.assertTrue(missing.is_dir())
+        self.assertEqual(stats["capped"], 1)
+
+    def test_prune_cap_ignores_pinned(self) -> None:
+        old = time.time() - 400
+        pinned = self._folder("pinned-job")
+        (pinned / "job.md").write_text("# Pin — Role\n", encoding="utf-8")
+        (pinned / "resume.pdf").write_bytes(pdf_bytes(1))
+        (pinned / ".keep").write_text("", encoding="utf-8")
+        os.utime(pinned, (old, old))
+        unpinned = self._folder("fresh-job")
+        (unpinned / "job.md").write_text("# Fresh — Role\n", encoding="utf-8")
+        (unpinned / "resume.pdf").write_bytes(pdf_bytes(1))
+        os.utime(unpinned, (old + 10, old + 10))
+        with patch("cleanup.APPS", self.apps):
+            stats = prune_applications(21, 1, now=datetime.now())
+        self.assertTrue(pinned.is_dir())
+        self.assertTrue(unpinned.is_dir())
+        self.assertEqual(stats["capped"], 0)
+
+    def test_prune_caps_oldest_complete_when_all_have_pdf(self) -> None:
+        old = time.time() - 400
+        older = self._folder("older-job")
+        (older / "job.md").write_text("# Old — Role\n", encoding="utf-8")
+        (older / "resume.pdf").write_bytes(pdf_bytes(1))
+        os.utime(older, (old, old))
+        newer = self._folder("newer-job")
+        (newer / "job.md").write_text("# New — Role\n", encoding="utf-8")
+        (newer / "resume.pdf").write_bytes(pdf_bytes(1))
+        os.utime(newer, (old + 10, old + 10))
+        with patch("cleanup.APPS", self.apps):
+            stats = prune_applications(21, 1, now=datetime.now())
+        self.assertFalse(older.exists())
+        self.assertTrue(newer.is_dir())
         self.assertEqual(stats["capped"], 1)
 
     def test_tidy_does_not_refresh_age_for_expiry(self) -> None:

@@ -15,6 +15,13 @@ The tailor may write **new bullets** from this file. It must not invent employer
 - Example Corp: added retries that dropped a 4% error rate to 0.3%
 - Batch Trainer: false-positive rate 1.2% after spectrogram cleanup
 
+## Voice and stories (cover letters and essays)
+
+Not for the résumé unless you say so. Letters should sit in one scene with cause and effect (what you noticed, what you did next), not recap résumé metrics.
+
+- Example: you distrusted a production alarm sitting near 50%, dug, and found phantom alerts leaking. Use that kind of object and sequence, not "I enjoy debugging."
+- If a prompt needs a story that is not here, write **Needs user** rather than inventing.
+
 ## Constraints
 
 - Work authorization, citizenship, and sponsorship live in `profile.json`

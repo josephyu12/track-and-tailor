@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import html
 import re
+import sys
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,10 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 REPORTS_DIR = Path(__file__).resolve().parent / "reports"
 APPLICATIONS = ROOT / "applications"
+SCRAPE = ROOT / ".cursor" / "skills" / "tailor-resume" / "scripts"
+
+sys.path.insert(0, str(SCRAPE))
+from check_resume import submit_pdf_path  # noqa: E402
 
 HEADING_RE = re.compile(
     r"^##\s+(\d+)\.\s+(.*?)(?:\s+\((required|optional)(?:,\s*([^)]+))?\))?\s*$"
@@ -123,7 +128,7 @@ def job_paths(slug: str) -> dict[str, Path]:
     folder = APPLICATIONS / slug
     return {
         "folder": folder,
-        "pdf": folder / "resume.pdf",
+        "pdf": submit_pdf_path(folder),
         "tex": folder / "resume.tex",
         "answers": folder / "application_questions.md",
         "job": folder / "job.md",

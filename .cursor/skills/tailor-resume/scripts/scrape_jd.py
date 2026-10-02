@@ -41,6 +41,20 @@ TIMEOUT = 45
 MIN_JD_CHARS = 280
 FETCH_ATTEMPTS = 4
 RETRY_HTTP = {408, 425, 429, 500, 502, 503, 504}
+CHROME_JD_RE = re.compile(
+    r"skip to main content|talent community|browse (all )?jobs|"
+    r"employee login|featured careers|job offer scams|"
+    r"candidate resources hub|select language|"
+    r"deutsch \(|espa[nñ]ol \(|fran[cç]ais \(",
+    re.I,
+)
+POSTING_JD_RE = re.compile(
+    r"\b(responsibilities|requirements|qualifications|"
+    r"what you.?ll do|minimum qualifications|"
+    r"preferred (skills|qualifications)|about the (role|internship)|"
+    r"you will)\b",
+    re.I,
+)
 FETCH_EXCEPTIONS = (
     urllib.error.URLError,
     IncompleteRead,
@@ -158,6 +172,68 @@ def html_to_text(fragment: str) -> str:
     if "&lt;" in text or "&#" in text:
         text = htmlmod.unescape(text)
     return strip_tags(text)
+
+
+def jd_looks_like_posting(text: str) -> bool:
+    """False for careers-site chrome that is long but is not a job posting."""
+    body = (text or "").strip()
+    if len(body) < MIN_JD_CHARS:
+        return False
+    chrome = len(CHROME_JD_RE.findall(body))
+    posting = len(POSTING_JD_RE.findall(body))
+    if posting >= 2:
+        return True
+    if chrome >= 3:
+        return False
+    if chrome >= 2 and posting == 0:
+        return False
+    return True
+
+
+def job_iframe_urls(html: str, page_url: str) -> list[str]:
+    """Same-origin iframes that usually hold the real iCIMS / ATS posting."""
+    page = urllib.parse.urlparse(page_url)
+    found: list[str] = []
+    seen: set[str] = set()
+    for src in re.findall(r'(?is)<iframe[^>]+src=["\']([^"\']+)["\']', html or ""):
+        abs_url = urllib.parse.urljoin(page_url, htmlmod.unescape(src))
+        parsed = urllib.parse.urlparse(abs_url)
+        if parsed.netloc.lower() != page.netloc.lower():
+            continue
+        path = parsed.path.lower()
+        qs = urllib.parse.parse_qs(parsed.query)
+        if qs.get("in_iframe") != ["1"] and "/job" not in path:
+            continue
+        key = abs_url.split("#")[0]
+        if key in seen or key.rstrip("/") == page_url.split("#")[0].rstrip("/"):
+            continue
+        seen.add(key)
+        found.append(abs_url)
+    return found[:3]
+
+
+def slice_job_region(html: str) -> str:
+    """Prefer the SuccessFactors / ATS job body over the careers chrome around it."""
+    start = -1
+    for pat in (
+        r'(?is)<div[^>]+class=["\'][^"\']*jobDisplay[^"\']*["\']',
+        r'(?is)<h1[^>]+id=["\']job-title["\']',
+        r'(?is)<div[^>]+class=["\'][^"\']*jobdescription[^"\']*["\']',
+        r'(?is)<div[^>]+(?:id|class)=["\'][^"\']*job[-_ ]?description[^"\']*["\']',
+    ):
+        m = re.search(pat, html or "")
+        if m:
+            start = m.start()
+            break
+    if start < 0:
+        return ""
+    rest = html[start:]
+    end = re.search(
+        r'(?is)id=["\']similar-jobs["\']|class=["\'][^"\']*similar-jobs',
+        rest,
+    )
+    chunk = rest[: end.start()] if end else rest[:80_000]
+    return strip_tags(chunk)
 
 
 def extract_json_ld_jobs(html: str) -> list[dict[str, Any]]:
@@ -672,6 +748,31 @@ def parse_oracle(url: str) -> dict[str, Any] | None:
     }
 
 
+def parse_icims(url: str) -> dict[str, Any] | None:
+    """iCIMS listings put the JobPosting JSON-LD on ?in_iframe=1, not the wrapper."""
+    parsed = urllib.parse.urlparse(url)
+    if "icims.com" not in parsed.netloc.lower():
+        return None
+    if not re.search(r"/jobs/\d+", parsed.path):
+        return None
+    qs = [
+        (k, v)
+        for k, v in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        if k.lower() != "in_iframe"
+    ]
+    qs.append(("in_iframe", "1"))
+    iframe = urllib.parse.urlunparse(
+        parsed._replace(query=urllib.parse.urlencode(qs))
+    )
+    if iframe.split("#")[0] == url.split("#")[0]:
+        return None
+    result = parse_html(iframe)
+    if result:
+        result["ats"] = "icims"
+        result["url"] = url
+    return result
+
+
 def parse_html(url: str) -> dict[str, Any]:
     try:
         final, html = fetch_text(url, accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
@@ -680,12 +781,36 @@ def parse_html(url: str) -> dict[str, Any]:
     except FETCH_EXCEPTIONS as e:
         return fail(url, f"{type(e).__name__}: {e}")
 
+    result = _parse_html_document(url, html, final)
+    if result.get("ok") and jd_looks_like_posting(result.get("jd_text") or ""):
+        return result
+    for iframe in job_iframe_urls(html, final):
+        try:
+            inner_final, inner_html = fetch_text(
+                iframe,
+                accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+        except (*FETCH_EXCEPTIONS, urllib.error.HTTPError):
+            continue
+        nested = _parse_html_document(url, inner_html, inner_final)
+        if nested.get("ok") and jd_looks_like_posting(nested.get("jd_text") or ""):
+            return nested
+    if result.get("ok") and not jd_looks_like_posting(result.get("jd_text") or ""):
+        result["ok"] = False
+        result["error"] = "chrome"
+    return result
+
+
+def _parse_html_document(url: str, html: str, final: str) -> dict[str, Any]:
     jobs = extract_json_ld_jobs(html)
     if jobs:
         out = from_jobposting(jobs[0], url)
         out["final_url"] = final
         out["questions"] = extract_questions_from_html(html)
-        if len(out.get("jd_text") or "") >= MIN_JD_CHARS:
+        jd = out.get("jd_text") or ""
+        if jd_looks_like_posting(jd) or (
+            len(jd) >= MIN_JD_CHARS and len(CHROME_JD_RE.findall(jd)) < 2
+        ):
             return out
 
     title = ""
@@ -709,19 +834,21 @@ def parse_html(url: str) -> dict[str, Any]:
     if sm:
         site = htmlmod.unescape(sm.group(1)).strip()
 
+    region = slice_job_region(html)
     main = html
-    for sel in (
-        r'(?is)<main\b[^>]*>(.*?)</main>',
-        r'(?is)<article\b[^>]*>(.*?)</article>',
-        r'(?is)<div[^>]+(?:id|class)=["\'][^"\']*(?:job[-_ ]?(?:description|details|posting)|posting|description)[^"\']*["\'][^>]*>(.*?)</div>',
-    ):
-        mm = re.search(sel, html)
-        if mm and len(mm.group(1)) > 400:
-            main = mm.group(1)
-            break
-
-    text = strip_tags(main)
-    # Drop obvious chrome
+    if len(region) >= MIN_JD_CHARS:
+        text = region
+    else:
+        for sel in (
+            r'(?is)<main\b[^>]*>(.*?)</main>',
+            r'(?is)<article\b[^>]*>(.*?)</article>',
+            r'(?is)<div[^>]+(?:id|class)=["\'][^"\']*(?:job[-_ ]?(?:description|details|posting)|jobdescription|posting|description)[^"\']*["\'][^>]*>(.*?)</div>',
+        ):
+            mm = re.search(sel, html)
+            if mm and len(mm.group(1)) > 400:
+                main = mm.group(1)
+                break
+        text = strip_tags(main)
     for noise in (
         r"(?im)^.*(cookie|sign in|log in|privacy policy|terms of use).*$",
     ):
@@ -729,18 +856,25 @@ def parse_html(url: str) -> dict[str, Any]:
 
     headline = og or title
     role, company = split_headline(headline, site)
+    loc = ""
+    lm = re.search(r'(?is)id=["\']job-location["\'][^>]*>(.*?)</', html)
+    if lm:
+        loc = html_to_text(lm.group(1))
 
+    ok = jd_looks_like_posting(text) or (
+        len(text) >= MIN_JD_CHARS and len(CHROME_JD_RE.findall(text)) < 2
+    )
     return {
-        "ok": len(text) >= MIN_JD_CHARS,
+        "ok": ok,
         "url": url,
         "final_url": final,
         "ats": "html",
         "company": company,
         "role": role,
-        "location": "",
+        "location": loc,
         "jd_text": text,
         "questions": extract_questions_from_html(html),
-        "error": None if len(text) >= MIN_JD_CHARS else "too_short",
+        "error": None if ok else ("chrome" if len(text) >= MIN_JD_CHARS else "too_short"),
     }
 
 
@@ -902,6 +1036,8 @@ def _scrape_one(url: str) -> dict[str, Any]:
         parsers.append(parse_workday)
     if "oraclecloud.com" in host:
         parsers.append(parse_oracle)
+    if "icims.com" in host:
+        parsers.append(parse_icims)
 
     last_err = None
     for parser in parsers:

@@ -4,12 +4,23 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parents[1] / ".cursor" / "skills" / "tailor-resume" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
-from check_resume import check_tex, gpu_skus, heading_budget, latex_to_visible  # noqa: E402
+from check_resume import (  # noqa: E402
+    check_tex,
+    gpu_skus,
+    heading_budget,
+    is_one_page,
+    latex_to_visible,
+    pdf_page_count,
+    resume_ready,
+    submit_pdf_name,
+    submit_pdf_path,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 MASTER = (ROOT / "master" / "resume.example.tex").read_text(encoding="utf-8")
@@ -21,6 +32,24 @@ EXAMPLE = r"""
       \resumeItem{Trained ranking models with CUDA GPU batch on \textbf{A100}/\textbf{L40S}}
     \resumeItemListEnd
 """
+
+
+def pdf_bytes(pages: int) -> bytes:
+    """Minimal PDF whose /Type/Page markers match pdf_page_count."""
+    if pages < 1:
+        raise ValueError("pages")
+    kids = " ".join(f"{i + 3} 0 R" for i in range(pages))
+    parts = [
+        "%PDF-1.1",
+        "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj",
+        f"2 0 obj<</Type/Pages/Kids[{kids}]/Count {pages}>>endobj",
+    ]
+    for i in range(pages):
+        parts.append(
+            f"{i + 3} 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>endobj"
+        )
+    parts += ["trailer<</Root 1 0 R>>", "%%EOF"]
+    return ("\n".join(parts) + "\n").encode("ascii")
 
 
 def tex_with_gpu_toggle(on: bool, body: str = EXAMPLE) -> str:
@@ -76,6 +105,73 @@ class CheckResume(unittest.TestCase):
             visible,
             "Example Labs | Python, AWS, Batch Computing",
         )
+
+
+class PdfPageCount(unittest.TestCase):
+    def test_one_and_two_page_fixtures(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        one = Path(tmp.name) / "one.pdf"
+        two = Path(tmp.name) / "two.pdf"
+        one.write_bytes(pdf_bytes(1))
+        two.write_bytes(pdf_bytes(2))
+        self.assertEqual(pdf_page_count(one), 1)
+        self.assertTrue(is_one_page(one))
+        self.assertEqual(pdf_page_count(two), 2)
+        self.assertFalse(is_one_page(two))
+
+
+class SubmitPdfName(unittest.TestCase):
+    def test_profile_name_is_first_last_resume(self) -> None:
+        name = submit_pdf_name()
+        self.assertRegex(name, r"^[A-Za-z0-9]+_[A-Za-z0-9]+_resume\.pdf$")
+        self.assertEqual(
+            submit_pdf_name({"first_name": "Joseph", "last_name": "Yu"}),
+            "Joseph_Yu_resume.pdf",
+        )
+        self.assertEqual(
+            submit_pdf_name({"first_name": "Alex", "last_name": "Rivera"}),
+            "Alex_Rivera_resume.pdf",
+        )
+
+    def test_promote_copies_latexmk_output(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        folder = Path(tmp.name)
+        (folder / "resume.pdf").write_bytes(b"%PDF-latexmk")
+        dest = submit_pdf_path(folder, promote=True)
+        self.assertEqual(dest.name, submit_pdf_name())
+        self.assertTrue(dest.is_file())
+        self.assertEqual(dest.read_bytes(), b"%PDF-latexmk")
+        self.assertTrue((folder / "resume.pdf").is_file())
+
+
+class ResumeReady(unittest.TestCase):
+    def test_missing_pdf_is_unready(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        folder = Path(tmp.name)
+        (folder / "resume.tex").write_text("%\n", encoding="utf-8")
+        ok, issues = resume_ready(folder)
+        self.assertFalse(ok)
+        self.assertTrue(any("missing" in i for i in issues))
+
+    def test_one_page_pdf_without_tex_is_ready(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        folder = Path(tmp.name)
+        (folder / "resume.pdf").write_bytes(pdf_bytes(1))
+        ok, issues = resume_ready(folder)
+        self.assertTrue(ok, issues)
+        self.assertEqual(issues, [])
+
+    def test_two_page_pdf_is_unready(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        folder = Path(tmp.name)
+        (folder / "resume.pdf").write_bytes(pdf_bytes(2))
+        ok, _ = resume_ready(folder)
+        self.assertFalse(ok)
 
 
 if __name__ == "__main__":

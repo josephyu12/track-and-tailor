@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,10 @@ from typing import Any, Iterable
 
 STATE = Path(__file__).resolve().parent / "state"
 DELETED_PATH = STATE / "deleted.json"
+SCRAPE = Path(__file__).resolve().parents[1] / ".cursor" / "skills" / "tailor-resume" / "scripts"
+
+sys.path.insert(0, str(SCRAPE))
+from check_resume import submit_pdf_path  # noqa: E402
 
 GENERIC_EXTRA = {
     "college",
@@ -238,7 +243,7 @@ def index_from_applications(
     for folder in apps.iterdir():
         if not folder.is_dir() or folder.name.startswith("."):
             continue
-        if require_pdf and not (folder / "resume.pdf").is_file():
+        if require_pdf and not submit_pdf_path(folder).is_file():
             continue
         ident = parse_job_identity(folder / "job.md")
         if ident:
@@ -258,7 +263,7 @@ def index_from_seen(
         if not isinstance(rec, dict) or rec.get("status") not in keep:
             continue
         slug = str(rec.get("slug") or "")
-        if require_pdf and (not slug or not apps or not (apps / slug / "resume.pdf").is_file()):
+        if require_pdf and (not slug or not apps or not submit_pdf_path(apps / slug).is_file()):
             continue
         idx.add(
             str(rec.get("company") or ""),

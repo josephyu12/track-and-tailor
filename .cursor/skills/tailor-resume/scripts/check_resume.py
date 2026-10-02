@@ -16,7 +16,9 @@ Usage (from repo root):
 from __future__ import annotations
 
 import argparse
+import json
 import re
+import shutil
 import subprocess
 import sys
 import zlib
@@ -43,7 +45,53 @@ def repo_root() -> Path:
     for parent in here.parents:
         if (parent / "master" / "resume.tex").exists():
             return parent
+        if (parent / "master" / "resume.example.tex").exists():
+            return parent
     return here.parents[4]
+
+
+def load_profile() -> dict:
+    path = repo_root() / ".cursor" / "skills" / "tailor-resume" / "profile.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _name_token(value: object, fallback: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9]+", "_", str(value or "").strip())
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text or fallback
+
+
+def submit_pdf_name(profile: dict | None = None) -> str:
+    """Submit PDF basename: First_Last_resume.pdf from profile.json."""
+    data = profile if profile is not None else load_profile()
+    first = _name_token(data.get("first_name"), "First")
+    last = _name_token(data.get("last_name"), "Last")
+    return f"{first}_{last}_resume.pdf"
+
+
+def submit_pdf_path(folder: Path, *, promote: bool = False) -> Path:
+    """Preferred submit PDF in an application folder.
+
+    Prefers First_Last_resume.pdf. Falls back to latexmk's resume.pdf.
+    If promote is true and only resume.pdf exists, copy it to the named file.
+    """
+    folder = Path(folder)
+    named = folder / submit_pdf_name()
+    legacy = folder / "resume.pdf"
+    if named.is_file():
+        return named
+    if legacy.is_file():
+        if promote:
+            shutil.copy2(legacy, named)
+            return named
+        return legacy
+    return named
 
 
 def strip_comments(tex: str) -> str:
@@ -205,9 +253,7 @@ def _run_text(cmd: list[str]) -> str:
 
 
 def _page_markers(blob: bytes) -> int:
-    return len(re.findall(rb"/Type\s*/Page(?!s)", blob)) + len(
-        re.findall(rb"/Type/Page(?!s)", blob)
-    )
+    return len(re.findall(rb"/Type\s*/Page(?!s)", blob))
 
 
 def pdf_page_count(pdf: Path) -> int | None:
@@ -253,6 +299,10 @@ def pdf_text(pdf: Path) -> str:
     return ""
 
 
+def is_one_page(pdf: Path) -> bool:
+    return pdf_page_count(pdf) == 1
+
+
 def check_pdf(pdf: Path) -> list[str]:
     issues: list[str] = []
     pages = pdf_page_count(pdf)
@@ -285,10 +335,8 @@ def check_pdf(pdf: Path) -> list[str]:
 def resolve_targets(path: Path) -> tuple[Path, Path | None]:
     if path.is_dir():
         tex = path / "resume.tex"
-        pdf = path / "resume.pdf"
-        if not pdf.exists():
-            pdf = path / "resume.pdf"
-        return tex, pdf if pdf.exists() else None
+        pdf = submit_pdf_path(path, promote=True)
+        return tex, pdf if pdf.is_file() else None
     if path.suffix.lower() == ".tex":
         return path, None
     raise SystemExit(f"not a resume folder or .tex file: {path}")
@@ -307,8 +355,26 @@ def check_path(path: Path, *, require_pdf: bool = False) -> list[str]:
     if pdf_path is not None:
         issues.extend(check_pdf(pdf_path))
     elif require_pdf:
-        issues.append(f"missing resume.pdf in {path}")
+        issues.append(f"missing {submit_pdf_name()} in {path}")
     return issues
+
+
+def resume_ready(folder: Path) -> tuple[bool, list[str]]:
+    """True when the folder has a one-page submit PDF that passes check_resume.
+
+    A PDF without resume.tex is judged on page count only (test fixtures).
+    """
+    folder = Path(folder)
+    if not folder.is_dir():
+        return False, [f"missing {folder}"]
+    pdf = submit_pdf_path(folder)
+    if not pdf.is_file():
+        return False, [f"missing {submit_pdf_name()} in {folder}"]
+    if (folder / "resume.tex").is_file():
+        issues = check_path(folder, require_pdf=True)
+        return (not issues, issues)
+    issues = check_pdf(pdf)
+    return (not issues, issues)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -317,7 +383,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--require-pdf",
         action="store_true",
-        help="fail if resume.pdf is missing (use after compile)",
+        help="fail if First_Last_resume.pdf is missing (use after compile)",
     )
     args = parser.parse_args(argv)
     path = Path(args.path)

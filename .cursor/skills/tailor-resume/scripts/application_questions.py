@@ -8,6 +8,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from check_resume import submit_pdf_name
+
 PROFILE_PATH = Path(__file__).resolve().parent.parent / "profile.json"
 
 SKIP_LABELS = re.compile(
@@ -426,8 +428,11 @@ def suggest_answer(q: dict[str, Any], profile: dict[str, Any] | None = None) -> 
 
     if kind == "upload":
         if re.search(r"cover letter", blob):
-            return "Optional upload. Use the drafted letter in this file if the form has a text box; otherwise paste into the cover-letter field."
-        return "Upload `resume.pdf` from this application folder."
+            return (
+                "Optional upload. Use `cover_letter.md` in this application folder if it exists; "
+                "otherwise paste the drafted letter from this file into the cover-letter field."
+            )
+        return f"Upload `{submit_pdf_name()}` from this application folder."
 
     if kind == "certify":
         yes = _match_option(options, "Yes", "I agree", "Agree")
@@ -548,8 +553,9 @@ def suggest_answer(q: dict[str, Any], profile: dict[str, Any] | None = None) -> 
 
     if kind == "written" or qtype == "textarea":
         return (
-            "DRAFT. Rewrite from master/resume.tex, master/bank.md, and writing.md. "
-            "Novel-like flowing prose. No resume recap, no em dashes, avoid colons, "
+            "DRAFT. Rewrite from master/resume.tex, master/bank.md Voice and stories, and writing.md. "
+            "Personal and realistic in depth. One bank scene with cause and effect. "
+            "No resume recap, no em dashes, avoid colons, "
             "no citizenship/relocation in cover letters. No invented facts."
         )
 

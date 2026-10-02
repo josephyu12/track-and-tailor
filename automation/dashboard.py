@@ -35,7 +35,8 @@ sys.path.insert(0, str(AUTO))
 sys.path.insert(0, str(SCRAPE))
 
 from cleanup import KEEP_NAME, tidy_folder  # noqa: E402
-from daily_run import SEEN_PATH, kill_tailor_for_slug, load_config, load_json, save_json, slugify, tailor_with_cursor, write_job_md  # noqa: E402
+from check_resume import is_one_page, resume_ready, submit_pdf_name, submit_pdf_path  # noqa: E402
+from daily_run import SEEN_PATH, kill_tailor_for_slug, load_config, load_json, save_json, slugify, tailor_with_cursor, write_job_md, COVER_LETTER_NAME, DEFAULT_PAGE_RETRIES  # noqa: E402
 from dedupe import (  # noqa: E402
     canonical_url,
     collapse_rows,
@@ -149,22 +150,38 @@ def _status_busy(state: str | None) -> bool:
 def _artifact_finished(slug: str, started: datetime | None, want: str) -> bool:
     """True when tailor output is newer than the running stamp (not the scrape copy)."""
     started_ts = started.timestamp() if started else 0.0
-    pdf = APPS / slug / "resume.pdf"
-    answers = APPS / slug / "application_questions.md"
     need_resume = "resume" in want
     need_answers = "answers" in want
+    need_cover = "cover" in want
+    if not (need_resume or need_answers or need_cover):
+        return False
     if need_resume:
+        pdf = submit_pdf_path(APPS / slug)
         if not (pdf.is_file() and pdf.stat().st_mtime >= started_ts - 1):
             return False
-        if not need_answers:
-            return True
+        if not is_one_page(pdf):
+            return False
     if need_answers:
-        return answers.is_file() and answers.stat().st_mtime >= started_ts + ANSWER_NEWER_THAN_START_S
-    return False
+        answers = APPS / slug / "application_questions.md"
+        if not (
+            answers.is_file()
+            and answers.stat().st_mtime >= started_ts + ANSWER_NEWER_THAN_START_S
+        ):
+            return False
+    if need_cover:
+        letter = APPS / slug / COVER_LETTER_NAME
+        if not (
+            letter.is_file()
+            and letter.stat().st_mtime >= started_ts + ANSWER_NEWER_THAN_START_S
+        ):
+            return False
+    return True
 
 
 def _reconcile_unlocked(data: dict[str, Any]) -> bool:
-    timeout = int((_cfg() or {}).get("agent_timeout_s") or 600) + STALE_RUNNING_GRACE_S
+    cfg = _cfg() or {}
+    timeout = int(cfg.get("agent_timeout_s") or 600) + STALE_RUNNING_GRACE_S
+    extra_page = int(cfg.get("page_retries", DEFAULT_PAGE_RETRIES))
     now = time.time()
     me = os.getpid()
     changed = False
@@ -190,7 +207,9 @@ def _reconcile_unlocked(data: dict[str, Any]) -> bool:
                 rec.pop("pid", None)
                 changed = True
             continue
-        phases = 2 if ("resume" in want and "answers" in want) else 1
+        phases = sum(1 for name in ("resume", "answers", "cover") if name in want) or 1
+        if "resume" in want:
+            phases += extra_page
         age = now - started_ts if started_ts else timeout + 1
         dead_worker = rec.get("pid") not in (None, me)
         if dead_worker or age > timeout * phases:
@@ -374,7 +393,7 @@ def parse_job_folder(folder: Path) -> dict[str, Any] | None:
             k, v = line[2:].split(":", 1)
             meta[k.strip().lower()] = v.strip()
     day = meta.get("date") or datetime.fromtimestamp(job.stat().st_mtime).date().isoformat()
-    pdf = folder / "resume.pdf"
+    pdf = submit_pdf_path(folder)
     min_score = float((_cfg() or {}).get("fit_min_score") or DEFAULT_MIN_SCORE)
     fit_path = folder / "fit.json"
     if not fit_path.is_file():
@@ -386,6 +405,7 @@ def parse_job_folder(folder: Path) -> dict[str, Any] | None:
         except json.JSONDecodeError:
             fit = {}
     src = meta.get("source") or ""
+    pdf_ok, _ = resume_ready(folder)
     return {
         "slug": folder.name,
         "company": company,
@@ -394,7 +414,9 @@ def parse_job_folder(folder: Path) -> dict[str, Any] | None:
         "url": src if src.startswith("http") else "",
         "source": src,
         "location": meta.get("location") or "",
-        "pdf": pdf.exists(),
+        "pdf": pdf.is_file(),
+        "pdf_ok": pdf_ok,
+        "pdf_name": pdf.name if pdf.is_file() else submit_pdf_name(),
         "keep": (folder / KEEP_NAME).exists(),
         "applied": is_applied(folder.name),
         "fit": fit,
@@ -494,7 +516,7 @@ def add_form(msg: str = "") -> str:
 {banner}
 <div class="card" id="add">
   <h2>Analyze a custom job</h2>
-  <p class="muted">Paste a posting URL and/or the JD. Analyze scores fit. Check what to generate (rerunnable later on the job page).</p>
+  <p class="muted">Paste a posting URL and/or the JD. Analyze scores fit. Check what to generate (rerunnable later on the job page). Cover letters are opt-in.</p>
   <form method="post" action="/analyze">
     <div class="row2">
       <div><label>Company</label><input type="text" name="company" placeholder="Acme"></div>
@@ -506,6 +528,7 @@ def add_form(msg: str = "") -> str:
     <textarea name="jd" placeholder="Paste the JD here if the URL is login-walled"></textarea>
     <label class="checks"><input type="checkbox" name="do_resume" value="1" checked> Tailor one-page resume</label>
     <label class="checks"><input type="checkbox" name="do_answers" value="1" checked> Draft application-form answers</label>
+    <label class="checks"><input type="checkbox" name="do_cover" value="1"> Draft cover letter</label>
     <div class="actions">
       <button class="btn btn-ghost" type="submit" name="mode" value="analyze">Analyze fit only</button>
       <button class="btn btn-apply" type="submit" name="mode" value="run">Analyze + run checked</button>
@@ -522,7 +545,14 @@ def jobs_table(rows: list[dict[str, Any]]) -> str:
     for r in rows:
         slug = r["slug"]
         apply = r["url"]
-        pdf = f'<a class="btn btn-pdf" href="/file/{urllib.parse.quote(slug)}/resume.pdf">PDF</a>' if r["pdf"] else '<span class="muted">—</span>'
+        pdf_name = urllib.parse.quote(r.get("pdf_name") or submit_pdf_name())
+        pdf_ok = bool(r.get("pdf_ok"))
+        if pdf_ok:
+            pdf = f'<a class="btn btn-pdf" href="/file/{urllib.parse.quote(slug)}/{pdf_name}">PDF</a>'
+        elif r["pdf"]:
+            pdf = f'<a class="btn btn-warn" href="/file/{urllib.parse.quote(slug)}/{pdf_name}">PDF</a>'
+        else:
+            pdf = '<span class="muted">—</span>'
         applied = bool(r.get("applied"))
         apply_b = apply_link(slug, apply, applied)
         cls = ' class="applied"' if applied else ""
@@ -538,6 +568,8 @@ def jobs_table(rows: list[dict[str, Any]]) -> str:
             badge = f'<span class="badge no">{score:.2f}</span>'
         pin = " · pinned" if r.get("keep") else ""
         needs = f' · {r["needs"]} need you' if r.get("needs") else ""
+        if not pdf_ok:
+            needs += ' · <span class="badge no">needs tailor</span>'
         dups = int(r.get("dup_count") or 0)
         if dups:
             loc_bit = ""
@@ -562,7 +594,7 @@ def overview_body(msg: str = "", rows: list[dict[str, Any]] | None = None) -> st
     rows = catalog() if rows is None else rows
     today = date.today().isoformat()
     today_rows = [r for r in rows if r["date"] == today]
-    pdfs = sum(1 for r in rows if r["pdf"])
+    pdfs = sum(1 for r in rows if r.get("pdf_ok"))
     applied_n = sum(1 for r in rows if r.get("applied"))
     return (
         add_form(msg)
@@ -602,9 +634,11 @@ def app_body(slug: str) -> str:
             "Generating in progress… this page updates when it finishes.</div>"
         )
     elif st.get("state") == "done":
-        banner = '<div class="banner">Done. Resume and/or answers were rewritten from master.</div>'
+        banner = '<div class="banner">Done. Resume, answers, and/or cover letter were rewritten from master.</div>'
     elif st.get("state") == "error":
         banner = f'<div class="banner">Failed: {html.escape(str(st.get("detail") or ""))}</div>'
+    if not rec.get("pdf_ok") and st.get("state") not in {"running", "queued"}:
+        banner += '<div class="banner">Needs a one-page tailored resume.</div>'
     score = fit.get("score")
     fit_line = ""
     if score is not None:
@@ -612,9 +646,14 @@ def app_body(slug: str) -> str:
         fit_line = f'<p><span class="badge {cls}">fit {score:.2f}</span> {html.escape(str(fit.get("reason") or ""))}</p>'
     apply = rec["url"]
     applied = bool(rec.get("applied"))
+    letter_path = folder / COVER_LETTER_NAME
+    has_letter = letter_path.is_file() and letter_path.stat().st_size > 20
     btns = [apply_link(slug, apply, applied)]
     if rec["pdf"]:
-        btns.append(f'<a class="btn btn-pdf" href="/file/{urllib.parse.quote(slug)}/resume.pdf">Resume PDF</a>')
+        pdf_name = urllib.parse.quote(rec.get("pdf_name") or submit_pdf_name())
+        cls = "btn-pdf" if rec.get("pdf_ok") else "btn-warn"
+        label = "Resume PDF" if rec.get("pdf_ok") else "Resume PDF (needs tailor)"
+        btns.append(f'<a class="btn {cls}" href="/file/{urllib.parse.quote(slug)}/{pdf_name}">{label}</a>')
     btns.append(f'<a class="btn btn-ghost" href="/file/{urllib.parse.quote(slug)}/job.md">job.md</a>')
     if not busy:
         qslug = urllib.parse.quote(slug)
@@ -627,6 +666,12 @@ def app_body(slug: str) -> str:
             f'<form method="post" action="/generate/{qslug}" style="display:inline">'
             f'<input type="hidden" name="do_answers" value="1">'
             f'<button class="btn btn-warn" type="submit">Rerun answers</button></form>'
+        )
+        cover_label = "Rerun cover letter" if has_letter else "Make cover letter"
+        btns.append(
+            f'<form method="post" action="/generate/{qslug}" style="display:inline">'
+            f'<input type="hidden" name="do_cover" value="1">'
+            f'<button class="btn btn-warn" type="submit">{cover_label}</button></form>'
         )
         btns.append(
             f'<form method="post" action="/generate/{qslug}" style="display:inline">'
@@ -645,6 +690,22 @@ def app_body(slug: str) -> str:
             f'<button class="copy" type="button" data-copy="{aid}">Copy</button></div>'
         )
     loc = html.escape(rec.get("location") or "")
+    if has_letter:
+        letter_txt = letter_path.read_text(encoding="utf-8", errors="replace").strip()
+        letter_block = (
+            '<div class="card"><h2>Cover letter</h2>'
+            '<div class="qa"><div>'
+            f'<pre class="answer" id="cover-letter">{html.escape(letter_txt)}</pre></div>'
+            '<button class="copy" type="button" data-copy="cover-letter">Copy</button></div>'
+            f'<p class="muted"><a href="/file/{urllib.parse.quote(slug)}/{COVER_LETTER_NAME}">'
+            f"{COVER_LETTER_NAME}</a></p></div>"
+        )
+    else:
+        letter_block = (
+            '<div class="card"><h2>Cover letter</h2>'
+            '<p class="muted">None yet. The daily watcher does not write one. '
+            "Use Make cover letter when you want a pasteable draft.</p></div>"
+        )
     return f"""
 {banner}
 <div class="card">
@@ -653,6 +714,7 @@ def app_body(slug: str) -> str:
   {fit_line}
   <div class="actions">{"".join(btns)}</div>
 </div>
+{letter_block}
 <div class="card"><h2>Answers to paste</h2>
 {"".join(qa) or '<p class="muted">No form questions captured.</p>'}
 </div>
@@ -699,7 +761,7 @@ def analyze(fields: dict[str, str]) -> tuple[str, str]:
         if not re.match(r"^https?://", url, re.I):
             return "", "URL must start with http."
         hit = idx.match_exact_url(url)
-        if hit and (APPS / hit / "resume.pdf").is_file():
+        if hit and submit_pdf_path(APPS / hit).is_file():
             return "", _already_saved_msg(hit)
         if hit:
             reuse_slug = hit
@@ -708,7 +770,7 @@ def analyze(fields: dict[str, str]) -> tuple[str, str]:
             return "", busy
     elif company and role:
         hit = idx.match(company, role, "")
-        if hit and (APPS / hit / "resume.pdf").is_file():
+        if hit and submit_pdf_path(APPS / hit).is_file():
             return "", _already_saved_msg(hit)
         if hit:
             reuse_slug = hit
@@ -749,7 +811,7 @@ def _analyze_after_gate(
     role = str(scraped.get("role") or role or "Intern")
     jd_text = (scraped.get("jd_text") or jd).strip()
     hit = reuse_slug or index_from_applications(APPS).match(company, role, url)
-    if hit and (APPS / hit / "resume.pdf").is_file():
+    if hit and submit_pdf_path(APPS / hit).is_file():
         return "", _already_saved_msg(hit)
     term = evaluate_term(role, jd_text)
     if not term.ok:
@@ -777,12 +839,15 @@ def _analyze_after_gate(
     write_fit_json(folder, fit, extra={"custom": True})
     if mode in {"run", "tailor"}:
         if mode == "tailor":
-            do_resume, do_answers = True, True
+            do_resume, do_answers, do_cover = True, True, False
         else:
             do_resume = fields.get("do_resume") == "1"
             do_answers = fields.get("do_answers") == "1"
-        if do_resume or do_answers:
-            start_tailor(slug, listing, do_resume=do_resume, do_answers=do_answers)
+            do_cover = fields.get("do_cover") == "1"
+        if do_resume or do_answers or do_cover:
+            start_tailor(
+                slug, listing, do_resume=do_resume, do_answers=do_answers, do_cover=do_cover
+            )
     return slug, ""
 
 
@@ -792,8 +857,13 @@ def start_tailor(
     *,
     do_resume: bool = True,
     do_answers: bool = True,
+    do_cover: bool = False,
 ) -> None:
-    bits = [n for n, on in (("resume", do_resume), ("answers", do_answers)) if on]
+    bits = [
+        n
+        for n, on in (("resume", do_resume), ("answers", do_answers), ("cover", do_cover))
+        if on
+    ]
     _set_status(slug, "queued", "+".join(bits))
     timeout = int(_cfg().get("agent_timeout_s") or 600)
 
@@ -809,6 +879,7 @@ def start_tailor(
                 timeout,
                 do_resume=do_resume,
                 do_answers=do_answers,
+                do_cover=do_cover,
                 on_start=mark_running,
             )
             if not (APPS / slug).is_dir():
@@ -881,10 +952,12 @@ class Handler(BaseHTTPRequestHandler):
             rest = path.split("/file/", 1)[-1]
             slug, _, name = rest.partition("/")
             if not SLUG_RE.match(slug) or name not in {
+                submit_pdf_name(),
                 "resume.pdf",
                 "job.md",
                 "application_questions.md",
                 "resume.tex",
+                COVER_LETTER_NAME,
             }:
                 self._send(404, b"not found", "text/plain")
                 return
@@ -932,14 +1005,21 @@ class Handler(BaseHTTPRequestHandler):
                 "url": rec["url"] or "pasted",
             }
             if key == "/tailor/":
-                do_resume, do_answers = True, True
+                do_resume, do_answers, do_cover = True, True, False
             else:
                 do_resume = fields.get("do_resume") == "1"
                 do_answers = fields.get("do_answers") == "1"
-            if not do_resume and not do_answers:
+                do_cover = fields.get("do_cover") == "1"
+            if not do_resume and not do_answers and not do_cover:
                 self._redir("/app/" + urllib.parse.quote(slug))
                 return
-            start_tailor(slug, listing, do_resume=do_resume, do_answers=do_answers)
+            start_tailor(
+                slug,
+                listing,
+                do_resume=do_resume,
+                do_answers=do_answers,
+                do_cover=do_cover,
+            )
             self._redir("/app/" + urllib.parse.quote(slug))
             return
         if path.startswith("/applied/"):

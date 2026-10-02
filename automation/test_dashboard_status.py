@@ -15,6 +15,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import dashboard  # noqa: E402
+from test_check_resume import pdf_bytes  # noqa: E402
 
 
 class StatusConcurrency(unittest.TestCase):
@@ -60,9 +61,19 @@ class StatusConcurrency(unittest.TestCase):
         folder.mkdir()
         dashboard._set_status(slug, "running", "resume")
         time.sleep(0.05)
-        (folder / "resume.pdf").write_bytes(b"%PDF")
+        (folder / "resume.pdf").write_bytes(pdf_bytes(1))
         rec = dashboard._status()[slug]
         self.assertEqual(rec["state"], "done")
+
+    def test_running_with_two_page_pdf_stays_running(self) -> None:
+        slug = "acme-swe"
+        folder = self.apps / slug
+        folder.mkdir()
+        dashboard._set_status(slug, "running", "resume")
+        time.sleep(0.05)
+        (folder / "resume.pdf").write_bytes(pdf_bytes(2))
+        rec = dashboard._status()[slug]
+        self.assertEqual(rec["state"], "running")
 
     def test_running_both_with_only_pdf_stays_running(self) -> None:
         slug = "acme-swe"
@@ -74,8 +85,37 @@ class StatusConcurrency(unittest.TestCase):
         rec = dashboard._status()[slug]
         self.assertEqual(rec["state"], "running")
 
+    def test_running_cover_with_newer_letter_becomes_done(self) -> None:
+        slug = "acme-swe"
+        folder = self.apps / slug
+        folder.mkdir()
+        dashboard._set_status(slug, "running", "cover")
+        with dashboard._STATUS_LOCK:
+            data = dashboard._load_status_unlocked()
+            data[slug]["at"] = (datetime.now() - timedelta(seconds=5)).isoformat(
+                timespec="seconds"
+            )
+            dashboard._write_status_unlocked(data)
+        (folder / "cover_letter.md").write_text(
+            "Dear Team,\n\n" + ("word " * 40), encoding="utf-8"
+        )
+        rec = dashboard._status()[slug]
+        self.assertEqual(rec["state"], "done")
+
+    def test_running_resume_and_cover_with_only_pdf_stays_running(self) -> None:
+        slug = "acme-swe"
+        folder = self.apps / slug
+        folder.mkdir()
+        dashboard._set_status(slug, "running", "resume+cover")
+        time.sleep(0.05)
+        (folder / "resume.pdf").write_bytes(b"%PDF")
+        rec = dashboard._status()[slug]
+        self.assertEqual(rec["state"], "running")
+
     def test_queued_survives_stale_timer(self) -> None:
-        with patch.object(dashboard, "_cfg", return_value={"agent_timeout_s": 1}):
+        with patch.object(
+            dashboard, "_cfg", return_value={"agent_timeout_s": 1, "page_retries": 0}
+        ):
             dashboard._set_status("x", "queued", "resume+answers")
             with dashboard._STATUS_LOCK:
                 data = dashboard._load_status_unlocked()
@@ -92,7 +132,9 @@ class StatusConcurrency(unittest.TestCase):
         self.assertEqual(rec["state"], "running")
 
     def test_stale_running_without_artifacts_errors(self) -> None:
-        with patch.object(dashboard, "_cfg", return_value={"agent_timeout_s": 1}):
+        with patch.object(
+            dashboard, "_cfg", return_value={"agent_timeout_s": 1, "page_retries": 0}
+        ):
             dashboard._set_status("x", "running", "resume+answers")
             with dashboard._STATUS_LOCK:
                 data = dashboard._load_status_unlocked()
@@ -407,6 +449,87 @@ class DeleteKillsTailor(unittest.TestCase):
         except (ProcessLookupError, PermissionError, OSError):
             alive = False
         self.assertFalse(alive)
+
+
+class CoverLetterUi(unittest.TestCase):
+    def test_add_form_has_unchecked_cover_checkbox(self) -> None:
+        html = dashboard.add_form()
+        self.assertIn('name="do_cover"', html)
+        self.assertIn("Draft cover letter", html)
+        self.assertNotIn('name="do_cover" value="1" checked', html)
+
+    def test_job_page_has_make_cover_letter(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        apps = Path(self.tmp.name) / "apps"
+        apps.mkdir()
+        _write_job(apps, "acme-swe", "Acme", "SWE Intern", "https://example.com/j")
+        with patch.object(dashboard, "APPS", apps):
+            body = dashboard.app_body("acme-swe")
+        self.assertIn("Make cover letter", body)
+        self.assertIn('name="do_cover"', body)
+        self.assertIn("None yet", body)
+
+    def test_job_page_shows_existing_letter(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        apps = Path(self.tmp.name) / "apps"
+        apps.mkdir()
+        _write_job(apps, "acme-swe", "Acme", "SWE Intern", "https://example.com/j")
+        (apps / "acme-swe" / "cover_letter.md").write_text(
+            "Dear Team,\n\nI noticed how Acme ships the compiler in pieces.\n",
+            encoding="utf-8",
+        )
+        with patch.object(dashboard, "APPS", apps):
+            body = dashboard.app_body("acme-swe")
+        self.assertIn("Rerun cover letter", body)
+        self.assertIn("I noticed how Acme ships the compiler in pieces.", body)
+
+
+class JobsTablePdf(unittest.TestCase):
+    def test_jobs_table_warns_when_pdf_not_ok(self) -> None:
+        html = dashboard.jobs_table(
+            [
+                {
+                    "slug": "acme-swe",
+                    "company": "Acme",
+                    "title": "SWE Intern",
+                    "date": "2026-09-02",
+                    "url": "https://example.com/j",
+                    "pdf": True,
+                    "pdf_ok": False,
+                    "pdf_name": "Joseph_Yu_resume.pdf",
+                    "keep": False,
+                    "applied": False,
+                    "fit": {},
+                    "needs": 0,
+                }
+            ]
+        )
+        self.assertIn("needs tailor", html)
+        self.assertIn("btn-warn", html)
+
+    def test_jobs_table_ok_pdf_is_green(self) -> None:
+        html = dashboard.jobs_table(
+            [
+                {
+                    "slug": "acme-swe",
+                    "company": "Acme",
+                    "title": "SWE Intern",
+                    "date": "2026-09-02",
+                    "url": "https://example.com/j",
+                    "pdf": True,
+                    "pdf_ok": True,
+                    "pdf_name": "Joseph_Yu_resume.pdf",
+                    "keep": False,
+                    "applied": False,
+                    "fit": {},
+                    "needs": 0,
+                }
+            ]
+        )
+        self.assertNotIn("needs tailor", html)
+        self.assertIn("btn-pdf", html)
 
 
 if __name__ == "__main__":

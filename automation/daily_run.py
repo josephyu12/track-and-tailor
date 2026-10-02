@@ -48,6 +48,7 @@ from fit import backfill_missing_fits, evaluate_listing, sync_fit_json, write_fi
 from cleanup import run_cleanup, tidy_folder  # noqa: E402
 from dedupe import index_from_seen  # noqa: E402
 from term import evaluate_listing_term  # noqa: E402
+from place import outside_us, posting_outside_us  # noqa: E402
 
 UA = "TrackAndTailor/1.0"
 # Agents were opening GStack Browser ($B connect / $B handoff) on CAPTCHA.
@@ -70,10 +71,12 @@ TRANSIENT_AGENT_RE = re.compile(
 )
 RETRYABLE_KINDS = frozenset({"page", "format", "transient"})
 RETRY_STATUSES = frozenset({"tailor_failed", "scrape_failed"})
-SKIPPED_STATUSES = frozenset({"skipped_fit", "skipped_duplicate", "skipped_term"})
+SKIPPED_STATUSES = frozenset(
+    {"skipped_fit", "skipped_duplicate", "skipped_term", "skipped_country"}
+)
 NO_PDF_RETRY = frozenset({"tailored", "scraped", "skipped_duplicate"}) | RETRY_STATUSES
 DONE_WITHOUT_RETRY = frozenset(
-    {"seeded", "deleted", "dry_run", "skipped_fit", "skipped_term"}
+    {"seeded", "deleted", "dry_run", "skipped_fit", "skipped_term", "skipped_country"}
 )
 PIDFILE_NAME = ".tailor.pid"
 _AGENT_LOCK = threading.Lock()
@@ -170,6 +173,8 @@ def matches(listing: dict[str, Any], cfg: dict[str, Any]) -> bool:
     for needle in cfg.get("title_exclude") or []:
         if needle.lower() in title.lower():
             return False
+    if outside_us(listing.get("locations") or []):
+        return False
     url = str(listing.get("url") or "")
     if not url.startswith("http"):
         return False
@@ -1280,7 +1285,16 @@ def run(args: argparse.Namespace) -> int:
                 fit = evaluate_listing(item, jd=jd_text, min_score=min_score)
                 fit_score = fit.score
                 term = evaluate_listing_term(item, jd=jd_text)
-                if not term.ok:
+                loc = str(scraped.get("location") or "")
+                if posting_outside_us(item.get("locations") or [], loc):
+                    shown = loc or ", ".join(
+                        str(x) for x in (item.get("locations") or []) if str(x).strip()
+                    )
+                    status = "skipped_country"
+                    detail = f"outside the US ({shown})" if shown else "outside the US"
+                    log(f"skip {company} — {title} ({detail[:120]})")
+                    slug = str(prev.get("slug") or "")
+                elif not term.ok:
                     status = "skipped_term"
                     detail = term.reason
                     log(f"skip {company} — {title} ({term.reason[:120]})")
@@ -1379,7 +1393,7 @@ def run(args: argparse.Namespace) -> int:
     skipped = sum(1 for r in results if r["status"] in SKIPPED_STATUSES)
     failed = sum(1 for r in results if r["status"] not in {"tailored"} | SKIPPED_STATUSES)
     summary = (
-        f"{tailored} tailored, {skipped} skipped (fit/duplicate/term), {failed} failed, {len(leftover)} queued"
+        f"{tailored} tailored, {skipped} skipped (fit/duplicate/term/country), {failed} failed, {len(leftover)} queued"
     )
     log(summary)
     if cfg.get("notify") and (results or cfg.get("notify_if_empty")):

@@ -256,15 +256,7 @@ def _page_markers(blob: bytes) -> int:
     return len(re.findall(rb"/Type\s*/Page(?!s)", blob))
 
 
-def pdf_page_count(pdf: Path) -> int | None:
-    info = _run_text(["pdfinfo", str(pdf)])
-    m = re.search(r"^Pages:\s*(\d+)", info, re.M)
-    if m:
-        return int(m.group(1))
-    mdls = _run_text(["mdls", "-name", "kMDItemNumberOfPages", "-raw", str(pdf)])
-    if mdls.strip().isdigit():
-        return int(mdls.strip())
-    data = pdf.read_bytes()
+def _pdf_page_count_local(data: bytes) -> int | None:
     n = _page_markers(data)
     if n:
         return n
@@ -286,6 +278,24 @@ def pdf_page_count(pdf: Path) -> int | None:
         return inflated
     counts = [int(c) for c in re.findall(rb"/Count\s+(\d+)", data)]
     return max(counts) if counts else None
+
+
+def pdf_page_count(pdf: Path) -> int | None:
+    """Page count from the file bytes, then pdfinfo if the bytes have no markers."""
+    try:
+        local = _pdf_page_count_local(pdf.read_bytes())
+    except OSError:
+        local = None
+    if local:
+        return local
+    info = _run_text(["pdfinfo", str(pdf)])
+    m = re.search(r"^Pages:\s*(\d+)", info, re.M)
+    if m:
+        return int(m.group(1))
+    mdls = _run_text(["mdls", "-name", "kMDItemNumberOfPages", "-raw", str(pdf)])
+    if mdls.strip().isdigit():
+        return int(mdls.strip())
+    return None
 
 
 def pdf_text(pdf: Path) -> str:

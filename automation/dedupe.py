@@ -115,7 +115,10 @@ def canonical_url(url: str) -> str:
 
 
 def titles_equivalent(a: str, b: str) -> bool:
-    na, nb = normalize_title(a), normalize_title(b)
+    return _titles_equivalent_norm(normalize_title(a), normalize_title(b))
+
+
+def _titles_equivalent_norm(na: str, nb: str) -> bool:
     if not na or not nb:
         return False
     if na == nb:
@@ -307,34 +310,43 @@ def _row_rank(row: dict[str, Any]) -> tuple:
 
 
 def collapse_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    kept: list[dict[str, Any]] = []
+    # Normalize once. same_job() on every pair re-parses every URL and blows
+    # the dashboard load time once there are a couple hundred folders.
+    prepared: list[tuple[str, str, str, dict[str, Any]]] = []
     for row in rows:
+        prepared.append(
+            (
+                canonical_url(str(row.get("url") or "")),
+                normalize_company(str(row.get("company") or "")),
+                normalize_title(str(row.get("title") or "")),
+                row,
+            )
+        )
+    kept: list[tuple[str, str, str, dict[str, Any]]] = []
+    for cu, co, ti, row in prepared:
         hit = None
         for existing in kept:
-            if same_job(
-                str(row.get("company") or ""),
-                str(row.get("title") or ""),
-                str(row.get("url") or ""),
-                str(existing.get("company") or ""),
-                str(existing.get("title") or ""),
-                str(existing.get("url") or ""),
-            ):
+            ecu, eco, eti, _existing_row = existing
+            if (cu and ecu and cu == ecu) or (co == eco and _titles_equivalent_norm(ti, eti)):
                 hit = existing
                 break
         if hit is None:
             row = dict(row)
             row["dups"] = []
-            kept.append(row)
+            kept.append((cu, co, ti, row))
             continue
-        extras: list[dict[str, Any]] = hit.setdefault("dups", [])
-        if _row_rank(row) < _row_rank(hit):
-            extras.append({k: hit[k] for k in hit if k != "dups"})
+        _ecu, _eco, _eti, hit_row = hit
+        extras: list[dict[str, Any]] = hit_row.setdefault("dups", [])
+        if _row_rank(row) < _row_rank(hit_row):
+            extras.append({k: hit_row[k] for k in hit_row if k != "dups"})
             for key, val in row.items():
                 if key != "dups":
-                    hit[key] = val
+                    hit_row[key] = val
+            kept[kept.index(hit)] = (cu, co, ti, hit_row)
         else:
             extras.append(row)
-    for row in kept:
+    out: list[dict[str, Any]] = []
+    for _cu, _co, _ti, row in kept:
         dups = row.get("dups") or []
         locs = []
         for extra in dups:
@@ -343,4 +355,5 @@ def collapse_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
                 locs.append(loc)
         row["dup_count"] = len(dups)
         row["dup_locations"] = locs
-    return kept
+        out.append(row)
+    return out

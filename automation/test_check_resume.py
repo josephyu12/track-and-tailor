@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1] / ".cursor" / "skills" / "tailor-resume" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -119,6 +120,14 @@ class PdfPageCount(unittest.TestCase):
         self.assertTrue(is_one_page(one))
         self.assertEqual(pdf_page_count(two), 2)
         self.assertFalse(is_one_page(two))
+
+    def test_markers_skip_pdfinfo(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        one = Path(tmp.name) / "one.pdf"
+        one.write_bytes(pdf_bytes(1))
+        with patch("check_resume._run_text", side_effect=AssertionError("pdfinfo")):
+            self.assertEqual(pdf_page_count(one), 1)
 
 
 class SubmitPdfName(unittest.TestCase):

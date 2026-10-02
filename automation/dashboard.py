@@ -35,7 +35,7 @@ sys.path.insert(0, str(AUTO))
 sys.path.insert(0, str(SCRAPE))
 
 from cleanup import KEEP_NAME, tidy_folder  # noqa: E402
-from check_resume import is_one_page, resume_ready, submit_pdf_name, submit_pdf_path  # noqa: E402
+from check_resume import is_one_page, pdf_page_count, resume_ready, submit_pdf_name, submit_pdf_path  # noqa: E402
 from daily_run import SEEN_PATH, kill_tailor_for_slug, load_config, load_json, save_json, slugify, tailor_with_cursor, write_job_md, COVER_LETTER_NAME, DEFAULT_PAGE_RETRIES  # noqa: E402
 from dedupe import (  # noqa: E402
     canonical_url,
@@ -49,12 +49,16 @@ from fit import DEFAULT_MIN_SCORE, evaluate_job_md, sync_fit_json, write_fit_jso
 from report import parse_answers_md  # noqa: E402
 from scrape_jd import scrape_one  # noqa: E402
 from term import custom_term_alert, evaluate_term  # noqa: E402
+from place import posting_outside_us  # noqa: E402
 
 TAILOR_STATUS = STATE / "tailor_status.json"
 APPLIED_PATH = STATE / "applied.json"
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,90}$")
 _STATUS_LOCK = threading.Lock()
 _APPLIED_LOCK = threading.Lock()
+_CATALOG_LOCK = threading.Lock()
+_CATALOG_MEM: tuple[Any, list[dict[str, Any]]] | None = None
+_PDF_PAGES_PATH = STATE / "pdf_pages.json"
 _IN_FLIGHT_LOCK = threading.Lock()
 _IN_FLIGHT_URLS: set[str] = set()
 STALE_RUNNING_GRACE_S = 90
@@ -375,7 +379,67 @@ def apply_link(slug: str, url: str, applied: bool) -> str:
     return f"{btn} {box}"
 
 
-def parse_job_folder(folder: Path) -> dict[str, Any] | None:
+def _slug_applied(slug: str, applied: dict[str, Any] | None) -> bool:
+    if applied is None:
+        return is_applied(slug)
+    rec = applied.get(slug)
+    return bool(isinstance(rec, dict) and rec.get("applied"))
+
+
+def _cached_page_count(pdf: Path, cache: dict[str, Any], seen: set[str]) -> int | None:
+    """Page count remembered by path, size, and mtime so the list does not reread every PDF."""
+    try:
+        st = pdf.stat()
+    except OSError:
+        return None
+    key = str(pdf)
+    seen.add(key)
+    rec = cache.get(key)
+    if (
+        isinstance(rec, dict)
+        and rec.get("mtime_ns") == st.st_mtime_ns
+        and rec.get("size") == st.st_size
+        and isinstance(rec.get("pages"), int)
+    ):
+        return rec["pages"]
+    pages = pdf_page_count(pdf)
+    cache[key] = {"mtime_ns": st.st_mtime_ns, "size": st.st_size, "pages": pages}
+    return pages
+
+
+def _catalog_stamp() -> tuple[Any, ...]:
+    named = submit_pdf_name()
+    parts: list[Any] = []
+    try:
+        parts.append(APPLIED_PATH.stat().st_mtime_ns)
+    except OSError:
+        parts.append(0)
+    if not APPS.is_dir():
+        return tuple(parts)
+    for folder in sorted(APPS.iterdir(), key=lambda p: p.name):
+        if not folder.is_dir() or folder.name.startswith("."):
+            continue
+        try:
+            parts.append((folder.name, folder.stat().st_mtime_ns))
+        except OSError:
+            continue
+        for name in ("job.md", "fit.json", "application_questions.md", KEEP_NAME, named, "resume.pdf"):
+            try:
+                parts.append((folder / name).stat().st_mtime_ns)
+            except OSError:
+                parts.append(0)
+    return tuple(parts)
+
+
+def parse_job_folder(
+    folder: Path,
+    *,
+    full_pdf: bool = False,
+    applied: dict[str, Any] | None = None,
+    min_score: float | None = None,
+    pdf_cache: dict[str, Any] | None = None,
+    pdf_seen: set[str] | None = None,
+) -> dict[str, Any] | None:
     job = folder / "job.md"
     if not job.exists():
         return None
@@ -394,7 +458,8 @@ def parse_job_folder(folder: Path) -> dict[str, Any] | None:
             meta[k.strip().lower()] = v.strip()
     day = meta.get("date") or datetime.fromtimestamp(job.stat().st_mtime).date().isoformat()
     pdf = submit_pdf_path(folder)
-    min_score = float((_cfg() or {}).get("fit_min_score") or DEFAULT_MIN_SCORE)
+    if min_score is None:
+        min_score = float((_cfg() or {}).get("fit_min_score") or DEFAULT_MIN_SCORE)
     fit_path = folder / "fit.json"
     if not fit_path.is_file():
         sync_fit_json(folder, min_score)
@@ -405,7 +470,14 @@ def parse_job_folder(folder: Path) -> dict[str, Any] | None:
         except json.JSONDecodeError:
             fit = {}
     src = meta.get("source") or ""
-    pdf_ok, _ = resume_ready(folder)
+    # The overview lists every folder. Page count from the PDF bytes is enough
+    # there. The full tex/text check stays on the single job page.
+    if full_pdf:
+        pdf_ok, _ = resume_ready(folder)
+    elif pdf.is_file() and pdf_cache is not None and pdf_seen is not None:
+        pdf_ok = _cached_page_count(pdf, pdf_cache, pdf_seen) == 1
+    else:
+        pdf_ok = bool(pdf.is_file() and is_one_page(pdf))
     return {
         "slug": folder.name,
         "company": company,
@@ -418,24 +490,50 @@ def parse_job_folder(folder: Path) -> dict[str, Any] | None:
         "pdf_ok": pdf_ok,
         "pdf_name": pdf.name if pdf.is_file() else submit_pdf_name(),
         "keep": (folder / KEEP_NAME).exists(),
-        "applied": is_applied(folder.name),
+        "applied": _slug_applied(folder.name, applied),
         "fit": fit,
         "needs": sum(1 for q in parse_answers_md(folder / "application_questions.md") if q["state"] == "needs"),
     }
 
 
-def catalog() -> list[dict[str, Any]]:
+def _build_catalog() -> list[dict[str, Any]]:
     if not APPS.is_dir():
         return []
+    applied = _applied()
+    min_score = float((_cfg() or {}).get("fit_min_score") or DEFAULT_MIN_SCORE)
+    raw_cache = load_json(_PDF_PAGES_PATH, {})
+    pdf_cache: dict[str, Any] = raw_cache if isinstance(raw_cache, dict) else {}
+    before = json.dumps(pdf_cache, sort_keys=True)
+    pdf_seen: set[str] = set()
     rows = []
     for folder in APPS.iterdir():
         if not folder.is_dir() or folder.name.startswith("."):
             continue
-        rec = parse_job_folder(folder)
+        rec = parse_job_folder(
+            folder,
+            applied=applied,
+            min_score=min_score,
+            pdf_cache=pdf_cache,
+            pdf_seen=pdf_seen,
+        )
         if rec:
             rows.append(rec)
+    kept = {k: pdf_cache[k] for k in pdf_seen if k in pdf_cache}
+    if json.dumps(kept, sort_keys=True) != before:
+        save_json(_PDF_PAGES_PATH, kept)
     rows.sort(key=lambda r: (r["date"], r["company"]), reverse=True)
     return collapse_rows(rows)
+
+
+def catalog() -> list[dict[str, Any]]:
+    global _CATALOG_MEM
+    stamp = _catalog_stamp()
+    with _CATALOG_LOCK:
+        if _CATALOG_MEM is not None and _CATALOG_MEM[0] == stamp:
+            return _CATALOG_MEM[1]
+        rows = _build_catalog()
+        _CATALOG_MEM = (stamp, rows)
+        return rows
 
 
 def days_from(rows: list[dict[str, Any]]) -> list[str]:
@@ -616,7 +714,7 @@ def day_body(day: str, rows: list[dict[str, Any]] | None = None) -> str:
 
 def app_body(slug: str) -> str:
     folder = APPS / slug
-    rec = parse_job_folder(folder)
+    rec = parse_job_folder(folder, full_pdf=True)
     if not rec:
         return '<p class="muted">Not found.</p>'
     fit = rec.get("fit") or {}
@@ -810,6 +908,9 @@ def _analyze_after_gate(
     company = str(scraped.get("company") or company or "Company")
     role = str(scraped.get("role") or role or "Intern")
     jd_text = (scraped.get("jd_text") or jd).strip()
+    loc = str(scraped.get("location") or "").strip()
+    if posting_outside_us([], loc):
+        return "", f"Outside the US ({loc}). Not continuing."
     hit = reuse_slug or index_from_applications(APPS).match(company, role, url)
     if hit and submit_pdf_path(APPS / hit).is_file():
         return "", _already_saved_msg(hit)

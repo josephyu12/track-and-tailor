@@ -486,6 +486,36 @@ class CoverLetterUi(unittest.TestCase):
         self.assertIn("I noticed how Acme ships the compiler in pieces.", body)
 
 
+class CatalogPdfCheck(unittest.TestCase):
+    def test_list_uses_page_count_not_full_checker(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        apps = Path(tmp.name) / "apps"
+        folder = apps / "acme-swe"
+        _write_job(apps, "acme-swe", "Acme", "SWE Intern", "https://example.com/j")
+        (folder / "resume.pdf").write_bytes(pdf_bytes(1))
+        with patch.object(dashboard, "APPS", apps):
+            with patch.object(dashboard, "resume_ready", side_effect=AssertionError("full")):
+                rec = dashboard.parse_job_folder(folder)
+        self.assertIsNotNone(rec)
+        assert rec is not None
+        self.assertTrue(rec["pdf_ok"])
+
+    def test_job_page_still_runs_full_checker(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        apps = Path(tmp.name) / "apps"
+        folder = apps / "acme-swe"
+        _write_job(apps, "acme-swe", "Acme", "SWE Intern", "https://example.com/j")
+        (folder / "resume.pdf").write_bytes(pdf_bytes(1))
+        with patch.object(dashboard, "APPS", apps):
+            with patch.object(dashboard, "resume_ready", return_value=(False, ["two pages"])):
+                rec = dashboard.parse_job_folder(folder, full_pdf=True)
+        self.assertIsNotNone(rec)
+        assert rec is not None
+        self.assertFalse(rec["pdf_ok"])
+
+
 class JobsTablePdf(unittest.TestCase):
     def test_jobs_table_warns_when_pdf_not_ok(self) -> None:
         html = dashboard.jobs_table(

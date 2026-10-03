@@ -560,6 +560,79 @@ class JobsTablePdf(unittest.TestCase):
         )
         self.assertNotIn("needs tailor", html)
         self.assertIn("btn-pdf", html)
+        self.assertIn("Favorite", html)
+
+
+class Favorite(unittest.TestCase):
+    def test_row_shows_favorite_checkbox(self) -> None:
+        html = dashboard.jobs_table(
+            [
+                {
+                    "slug": "acme-swe",
+                    "company": "Acme",
+                    "title": "SWE Intern",
+                    "date": "2026-10-02",
+                    "url": "https://example.com/j",
+                    "pdf": False,
+                    "pdf_ok": False,
+                    "pdf_name": "Alex_Rivera_resume.pdf",
+                    "keep": True,
+                    "applied": False,
+                    "fit": {},
+                    "needs": 0,
+                }
+            ]
+        )
+        self.assertIn("Favorite", html)
+        self.assertIn("checked", html)
+        self.assertIn('class="favorite"', html)
+
+    def test_favorites_view_hides_the_rest(self) -> None:
+        rows = [
+            {
+                "slug": "kept-role",
+                "company": "Acme",
+                "title": "SWE Intern",
+                "date": "2026-10-02",
+                "url": "https://example.com/a",
+                "pdf": True,
+                "pdf_ok": True,
+                "keep": True,
+                "applied": False,
+                "fit": {},
+                "needs": 0,
+            },
+            {
+                "slug": "other-role",
+                "company": "Other",
+                "title": "SWE Intern",
+                "date": "2026-10-02",
+                "url": "https://example.com/b",
+                "pdf": True,
+                "pdf_ok": True,
+                "keep": False,
+                "applied": False,
+                "fit": {},
+                "needs": 0,
+            },
+        ]
+        body = dashboard.overview_body(rows=rows, favorites_only=True)
+        self.assertIn("kept-role", body)
+        self.assertNotIn("other-role", body)
+        self.assertNotIn("Places", body)
+
+    def test_favorite_toggles_keep_file(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        apps = Path(tmp.name) / "apps"
+        folder = apps / "acme-swe"
+        folder.mkdir(parents=True)
+        (folder / "job.md").write_text("# Acme — SWE Intern\n", encoding="utf-8")
+        with patch.object(dashboard, "APPS", apps):
+            self.assertIsNone(dashboard.set_favorite("acme-swe", True))
+            self.assertTrue((folder / ".keep").is_file())
+            self.assertIsNone(dashboard.set_favorite("acme-swe", False))
+            self.assertFalse((folder / ".keep").exists())
 
 
 if __name__ == "__main__":

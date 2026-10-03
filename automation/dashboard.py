@@ -113,6 +113,7 @@ pre.answer { white-space:pre-wrap; background:var(--bg); padding:8px 10px; borde
 .banner { background:#e8eef6; border-radius:8px; padding:8px 10px; margin:0 0 12px; }
 .did { background:#e8f6ee; color:var(--good); }
 tr.applied td { background:#f3faf6; }
+tr.favorite td:first-child { box-shadow: inset 3px 0 #c9a227; }
 .applied-box { display:flex; align-items:center; gap:6px; font-size:13px; font-weight:650; white-space:nowrap; }
 .applied-box input { width:16px; height:16px; }
 @media (max-width: 800px) { .wrap { grid-template-columns: 1fr; } .row2 { grid-template-columns:1fr; } }
@@ -362,6 +363,30 @@ def delete_application(slug: str) -> str | None:
     return None
 
 
+def set_favorite(slug: str, on: bool) -> str | None:
+    """Pin or unpin a folder. A favorite survives cleanup (the .keep file)."""
+    if not SLUG_RE.match(slug):
+        return "Bad slug."
+    folder = (APPS / slug).resolve()
+    if APPS.resolve() not in folder.parents or not folder.is_dir() or not (folder / "job.md").is_file():
+        return "Application not found."
+    keep = folder / KEEP_NAME
+    if on:
+        if not keep.exists():
+            keep.write_text("Favorited from the dashboard.\n", encoding="utf-8")
+    else:
+        keep.unlink(missing_ok=True)
+    return None
+
+
+def favorite_box(slug: str, on: bool) -> str:
+    checked = " checked" if on else ""
+    return (
+        f'<label class="applied-box"><input type="checkbox" class="js-favorite" '
+        f'data-slug="{html.escape(slug)}"{checked}> Favorite</label>'
+    )
+
+
 def apply_link(slug: str, url: str, applied: bool) -> str:
     qslug = urllib.parse.quote(slug)
     checked = " checked" if applied else ""
@@ -544,10 +569,18 @@ def days_from(rows: list[dict[str, Any]]) -> list[str]:
     return seen
 
 
-def page(title: str, body: str, day: str | None = None, rows: list[dict[str, Any]] | None = None) -> bytes:
+def page(
+    title: str,
+    body: str,
+    day: str | None = None,
+    rows: list[dict[str, Any]] | None = None,
+    favorites: bool = False,
+) -> bytes:
     rows = catalog() if rows is None else rows
     days = days_from(rows)
-    nav = ['<a href="/" class="%s">All days</a>' % ("on" if not day else "")]
+    home_on = not day and not favorites
+    nav = ['<a href="/" class="%s">All days</a>' % ("on" if home_on else "")]
+    nav.append(f'<a href="/?fav=1" class="{"on" if favorites else ""}">Favorites</a>')
     for d in days:
         nav.append(f'<a href="/day/{d}" class="{"on" if day == d else ""}">{html.escape(d)}</a>')
     doc = f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
@@ -587,6 +620,24 @@ document.querySelectorAll(".js-applied").forEach(function(cb){{
       method: "POST",
       headers: {{"Content-Type": "application/x-www-form-urlencoded"}},
       body: "applied=" + (on ? "1" : "0")
+    }});
+  }});
+}});
+function markFavoriteUI(slug, on) {{
+  document.querySelectorAll('.js-favorite[data-slug="'+slug+'"]').forEach(function(cb){{ cb.checked = on; }});
+  document.querySelectorAll('tr[data-slug="'+slug+'"]').forEach(function(tr){{
+    tr.classList.toggle("favorite", on);
+  }});
+}}
+document.querySelectorAll(".js-favorite").forEach(function(cb){{
+  cb.addEventListener("change", async function(){{
+    const slug = cb.getAttribute("data-slug");
+    const on = cb.checked;
+    markFavoriteUI(slug, on);
+    await fetch("/favorite/"+encodeURIComponent(slug), {{
+      method: "POST",
+      headers: {{"Content-Type": "application/x-www-form-urlencoded"}},
+      body: "favorite=" + (on ? "1" : "0")
     }});
   }});
 }});
@@ -653,7 +704,12 @@ def jobs_table(rows: list[dict[str, Any]]) -> str:
             pdf = '<span class="muted">—</span>'
         applied = bool(r.get("applied"))
         apply_b = apply_link(slug, apply, applied)
-        cls = ' class="applied"' if applied else ""
+        classes = []
+        if applied:
+            classes.append("applied")
+        if r.get("keep"):
+            classes.append("favorite")
+        cls = f' class="{" ".join(classes)}"' if classes else ""
         mark = ' <span class="badge did">applied</span>' if applied else ""
         fit = r.get("fit") or {}
         score = fit.get("score")
@@ -664,7 +720,6 @@ def jobs_table(rows: list[dict[str, Any]]) -> str:
             badge = f'<span class="badge ok">{score:.2f}</span>'
         else:
             badge = f'<span class="badge no">{score:.2f}</span>'
-        pin = " · pinned" if r.get("keep") else ""
         needs = f' · {r["needs"]} need you' if r.get("needs") else ""
         if not pdf_ok:
             needs += ' · <span class="badge no">needs tailor</span>'
@@ -678,8 +733,9 @@ def jobs_table(rows: list[dict[str, Any]]) -> str:
         tr.append(
             f'<tr{cls} data-slug="{html.escape(slug)}"><td>{html.escape(r["date"])}</td>'
             f'<td><a href="/app/{urllib.parse.quote(slug)}"><strong>{html.escape(r["company"])}</strong><br>'
-            f'<span class="muted">{html.escape(r["title"])}{pin}{needs}</span></a>{mark}</td>'
-            f'<td>{badge}</td><td>{apply_b} {pdf} {delete_form(slug, r["company"], r["title"])}</td></tr>'
+            f'<span class="muted">{html.escape(r["title"])}{needs}</span></a>{mark}</td>'
+            f'<td>{badge}</td><td>{apply_b} {favorite_box(slug, bool(r.get("keep")))} '
+            f'{pdf} {delete_form(slug, r["company"], r["title"])}</td></tr>'
         )
     return (
         "<table><thead><tr><th>Date</th><th>Role</th><th>Fit</th><th>Apply</th></tr></thead><tbody>"
@@ -688,22 +744,36 @@ def jobs_table(rows: list[dict[str, Any]]) -> str:
     )
 
 
-def overview_body(msg: str = "", rows: list[dict[str, Any]] | None = None) -> str:
+def overview_body(
+    msg: str = "",
+    rows: list[dict[str, Any]] | None = None,
+    favorites_only: bool = False,
+) -> str:
     rows = catalog() if rows is None else rows
+    shown = [r for r in rows if r.get("keep")] if favorites_only else list(rows)
     today = date.today().isoformat()
-    today_rows = [r for r in rows if r["date"] == today]
-    pdfs = sum(1 for r in rows if r.get("pdf_ok"))
-    applied_n = sum(1 for r in rows if r.get("applied"))
-    return (
-        add_form(msg)
-        + f'<div class="card"><h2>Today — {html.escape(today)}</h2>'
-        + f'<p class="muted">{len(today_rows)} jobs today · {len(rows)} kept on disk · {pdfs} PDFs · {applied_n} applied</p>'
-        + jobs_table(today_rows)
-        + "</div>"
-        + '<div class="card"><h2>All saved applications</h2>'
-        + jobs_table(rows)
-        + "</div>"
+    today_rows = [r for r in shown if r["date"] == today]
+    pdfs = sum(1 for r in shown if r.get("pdf_ok"))
+    applied_n = sum(1 for r in shown if r.get("applied"))
+    fav_n = sum(1 for r in rows if r.get("keep"))
+    stats = (
+        f'<p class="muted">{len(today_rows)} jobs today · {len(shown)} '
+        f'{"favorited" if favorites_only else "kept"} · {pdfs} PDFs · '
+        f'{applied_n} applied · {fav_n} favorited</p>'
     )
+    if favorites_only:
+        body = f'<div class="card"><h2>Favorites</h2>{stats}{jobs_table(shown)}</div>'
+    else:
+        body = (
+            f'<div class="card"><h2>Today — {html.escape(today)}</h2>'
+            + stats
+            + jobs_table(today_rows)
+            + "</div>"
+            + '<div class="card"><h2>All saved applications</h2>'
+            + jobs_table(shown)
+            + "</div>"
+        )
+    return add_form(msg) + body
 
 
 def day_body(day: str, rows: list[dict[str, Any]] | None = None) -> str:
@@ -746,7 +816,7 @@ def app_body(slug: str) -> str:
     applied = bool(rec.get("applied"))
     letter_path = folder / COVER_LETTER_NAME
     has_letter = letter_path.is_file() and letter_path.stat().st_size > 20
-    btns = [apply_link(slug, apply, applied)]
+    btns = [apply_link(slug, apply, applied), favorite_box(slug, bool(rec.get("keep")))]
     if rec["pdf"]:
         pdf_name = urllib.parse.quote(rec.get("pdf_name") or submit_pdf_name())
         cls = "btn-pdf" if rec.get("pdf_ok") else "btn-warn"
@@ -1020,9 +1090,12 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         if path == "/":
-            msg = urllib.parse.parse_qs(parsed.query).get("msg", [""])[0]
+            qs = urllib.parse.parse_qs(parsed.query)
+            msg = qs.get("msg", [""])[0]
+            favorites = (qs.get("fav") or ["0"])[0] in {"1", "true", "on", "yes"}
             rows = catalog()
-            self._send(200, page("Track and Tailor", overview_body(msg, rows=rows), rows=rows))
+            body = overview_body(msg, rows=rows, favorites_only=favorites)
+            self._send(200, page("Track and Tailor", body, rows=rows, favorites=favorites))
             return
         if path.startswith("/day/"):
             day = path.split("/day/", 1)[-1]
@@ -1122,6 +1195,15 @@ class Handler(BaseHTTPRequestHandler):
                 do_cover=do_cover,
             )
             self._redir("/app/" + urllib.parse.quote(slug))
+            return
+        if path.startswith("/favorite/"):
+            slug = urllib.parse.unquote(path.split("/favorite/", 1)[-1])
+            on = fields.get("favorite", "1") in {"1", "on", "true", "yes"}
+            err = set_favorite(slug, on)
+            if err:
+                self._send(404, err.encode(), "text/plain")
+                return
+            self._send(200, json.dumps({"ok": True, "favorite": on}).encode(), "application/json")
             return
         if path.startswith("/applied/"):
             slug = urllib.parse.unquote(path.split("/applied/", 1)[-1])

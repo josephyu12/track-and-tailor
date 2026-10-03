@@ -6,7 +6,8 @@ Catches the two failures that shove a project date into the italic stack:
 2. GPU SKUs (A100 / L40S / A10) in both the italic heading and that
    project's bullets — including via showprojectgpu.
 
-Also checks PDF page count and smashed date text (L40SDec.) when a PDF exists.
+Also checks PDF page count, smashed date text (L40SDec.), and wrapped
+lines that leave only a word or two on the next row.
 
 Usage (from repo root):
   python3 .cursor/skills/tailor-resume/scripts/check_resume.py applications/some-slug
@@ -23,6 +24,7 @@ import subprocess
 import sys
 import zlib
 from pathlib import Path
+from typing import NamedTuple
 
 GPU_SKU_RE = re.compile(r"(?<![A-Za-z0-9])(A100|L40S|A10)(?![A-Za-z0-9])", re.I)
 MONTH_SMASH_RE = re.compile(
@@ -38,6 +40,19 @@ ONEARG_CMD_RE = re.compile(
     r"\\(?:textbf|emph|textit|textrm|textup|text|small|normalsize)\s*\{"
 )
 FALLBACK_HEADING_BUDGET = 88
+# Ragged-right lines that actually wrapped still end a bit short of the margin.
+MARGIN_SLACK_PT = 48.0
+# A continuation narrower than this is a word or two, not a used line.
+STUB_MAX_WIDTH_PT = 150.0
+NEW_ITEM_RE = re.compile(r"^\s*[•·∙●▪‣]\s*")
+
+
+class VisualLine(NamedTuple):
+    y: float
+    x0: float
+    x1: float
+    size: float
+    text: str
 
 
 def repo_root() -> Path:
@@ -313,6 +328,90 @@ def is_one_page(pdf: Path) -> bool:
     return pdf_page_count(pdf) == 1
 
 
+def short_last_lines(lines: list[VisualLine]) -> list[str]:
+    """Flag a wrap whose last line is only a word or two.
+
+    A full line followed by a hanging indent, or by another skills/coursework
+    row at the same left edge, is a wasted row when that next line is narrower
+    than STUB_MAX_WIDTH_PT. New bullets (they start with a glyph) and the
+    right-hand date column are not wraps.
+    """
+    if len(lines) < 2:
+        return []
+    right = max(line.x1 for line in lines)
+    issues: list[str] = []
+    ordered = sorted(lines, key=lambda ln: (ln.y, ln.x0))
+    for prev, cur in zip(ordered, ordered[1:]):
+        if cur.y < prev.y + 2:
+            continue
+        if abs(cur.size - prev.size) > 1.25:
+            continue
+        if NEW_ITEM_RE.match(cur.text):
+            continue
+        if cur.x0 > right - 180:
+            continue
+        if right - prev.x1 > MARGIN_SLACK_PT:
+            continue
+        if cur.x0 < prev.x0 - 2 or cur.x0 > prev.x0 + 16:
+            continue
+        width = cur.x1 - cur.x0
+        if width >= STUB_MAX_WIDTH_PT:
+            continue
+        words = cur.text.split()
+        n = len(words)
+        label = "1 word" if n == 1 else f"{n} words"
+        snippet = cur.text.strip()[:90]
+        issues.append(
+            f"short last line ({label}, {width:.0f}pt) after a full line; "
+            f"cut so it fits on the line above, or add real content so the line is nearly full: {snippet}"
+        )
+    return issues
+
+
+def _import_pymupdf():
+    try:
+        import pymupdf
+    except ImportError:
+        pymupdf = None
+    if pymupdf is None:
+        try:
+            import fitz as pymupdf
+        except ImportError:
+            return None
+    return pymupdf
+
+
+def visual_lines(pdf: Path) -> list[VisualLine] | None:
+    """Text lines with positions. None when PyMuPDF is missing or the file is not a PDF."""
+    pymupdf = _import_pymupdf()
+    if pymupdf is None:
+        return None
+    try:
+        doc = pymupdf.open(pdf)
+    except Exception:
+        return None
+    lines: list[VisualLine] = []
+    try:
+        for page in doc:
+            data = page.get_text("dict")
+            for block in data.get("blocks", []):
+                if block.get("type") != 0:
+                    continue
+                for line in block.get("lines", []):
+                    spans = line.get("spans") or []
+                    text = "".join(span.get("text", "") for span in spans).strip()
+                    if not text:
+                        continue
+                    x0, y0, x1, _y1 = line["bbox"]
+                    size = max((float(span.get("size", 0)) for span in spans), default=0.0)
+                    lines.append(VisualLine(float(y0), float(x0), float(x1), size, text))
+    except Exception:
+        return None
+    finally:
+        doc.close()
+    return lines
+
+
 def check_pdf(pdf: Path) -> list[str]:
     issues: list[str] = []
     pages = pdf_page_count(pdf)
@@ -320,6 +419,9 @@ def check_pdf(pdf: Path) -> list[str]:
         issues.append(f"could not read page count from {pdf.name}")
     elif pages != 1:
         issues.append(f"PDF is {pages} pages; must be exactly 1")
+    positioned = visual_lines(pdf)
+    if positioned:
+        issues.extend(short_last_lines(positioned))
     text = pdf_text(pdf)
     if text:
         smash = MONTH_SMASH_RE.search(text.replace("\n", ""))

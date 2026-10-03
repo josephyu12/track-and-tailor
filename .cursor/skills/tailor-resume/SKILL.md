@@ -42,7 +42,7 @@ Cover letter only: if `applications/{slug}/` already exists, write `cover_letter
 7. Read `master/bank.md`, `master/resume.tex`, `.cursor/skills/tailor-resume/profile.json`, and [writing.md](writing.md). Open a source from [sources.md](sources.md) only when you need it.
 8. Extract JD keywords, then tailor the copy. You may write new bullets from bank + sources. Do not invent employers, dates, metrics, or tools.
 9. Compile: `latexmk -pdf -interaction=nonstopmode resume.tex` in the application directory, then `cp resume.pdf {First}_{Last}_resume.pdf` using `first_name` and `last_name` from `profile.json` (example: `Alex_Rivera_resume.pdf`). That is the submit file. Keep `resume.tex` as the source name. Do not leave the submit PDF named `resume.pdf`.
-10. The PDF must be **exactly one full page**. Overflow → trim, then fill if the page went sparse. Recompile after the last edit.
+10. The PDF must be **exactly one full page**. Overflow → trim, then fill if the page went sparse. A bullet, skills row, or coursework line that wraps and leaves a word or two on the last line wastes that row: cut so those words fit on the line above, or add true content so the last line is nearly full. Recompile after the last edit.
 11. Draft written answers per [writing.md](writing.md). Write a cover letter only when the user asked, the dashboard cover checkbox/button was used, or the apply form has a cover-letter field. Do not recap the resume. Do not put citizenship, visa, or relocation in a cover letter. Standalone letters go in `applications/{slug}/cover_letter.md`.
 12. Reply with the changelog format below (one block per role). Do not dump the full resume in chat.
 
@@ -141,6 +141,7 @@ Config: `automation/config.json`. After the agent exits, Python runs `check_resu
 - Never open GStack Browser or use `$B connect` / `$B handoff`.
 - Facts come from `master/resume.tex`, `master/bank.md`, and on-demand files in [sources.md](sources.md).
 - Keep exactly **one full page**. Sparse one-pagers fail. The watcher measures page count in Python after the agent returns and retries on overflow; do not ship a two-page PDF.
+- Keep lines full. After compile, a wrap whose last line is only a word or two is wasted space. Cut wording so that leftover fits on the line above, or add true facts so the last line is nearly as full as the lines above it. A short bullet that stays on one line is fine. `check_resume.py` fails these short wraps.
 - Do not change employer names, titles, dates, or GPA. The Yale degree line is the `showmolbio` toggle only: leave it **off** (Computer Science) unless the role itself is biology / biotech / computational biology / genomics / wet lab. A SWE or ML intern seat at a pharma company is not enough.
 - Do not rewrite the LaTeX preamble or layout macros.
 - Submit PDF name is `{First}_{Last}_resume.pdf` from `profile.json` (`first_name`, `last_name`). Never ship a tailored PDF named only `resume.pdf`.
@@ -154,7 +155,7 @@ Config: `automation/config.json`. After the agent exits, Python runs `check_resu
 python3 .cursor/skills/tailor-resume/scripts/check_resume.py applications/{slug}
 ```
 
-It must print `OK`. Italic project headings must not collide with dates. If GPU names are already in a project's bullets, do not also put them on the italic heading.
+It must print `OK`. Italic project headings must not collide with dates. If GPU names are already in a project's bullets, do not also put them on the italic heading. A last line that is only a word or two after a full line must be tightened or filled.
 
 ## Keywords
 

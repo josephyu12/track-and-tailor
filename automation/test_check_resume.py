@@ -12,6 +12,7 @@ from unittest.mock import patch
 SCRIPTS = Path(__file__).resolve().parents[1] / ".cursor" / "skills" / "tailor-resume" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 from check_resume import (  # noqa: E402
+    VisualLine,
     check_tex,
     gpu_skus,
     heading_budget,
@@ -19,8 +20,10 @@ from check_resume import (  # noqa: E402
     latex_to_visible,
     pdf_page_count,
     resume_ready,
+    short_last_lines,
     submit_pdf_name,
     submit_pdf_path,
+    visual_lines,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -106,6 +109,68 @@ class CheckResume(unittest.TestCase):
             visible,
             "Example Labs | Python, AWS, Batch Computing",
         )
+
+
+def _line(y: float, x0: float, x1: float, text: str, size: float = 10.0) -> VisualLine:
+    return VisualLine(y, x0, x1, size, text)
+
+
+class ShortLastLines(unittest.TestCase):
+    def test_two_word_wrap_fails(self) -> None:
+        lines = [
+            _line(100, 41, 570, "• Shipped a long service that fills the measure and then"),
+            _line(113, 50, 110, "stops early"),
+        ]
+        issues = short_last_lines(lines)
+        self.assertEqual(len(issues), 1)
+        self.assertIn("stops early", issues[0])
+        self.assertIn("short last line", issues[0])
+
+    def test_short_skills_wrap_fails(self) -> None:
+        lines = [
+            _line(200, 36, 560, "Developer Tools: AWS, Datadog, Vault, Docker, Helm, Terraform"),
+            _line(214, 36, 80, "Jupyter"),
+        ]
+        issues = short_last_lines(lines)
+        self.assertEqual(len(issues), 1)
+        self.assertIn("Jupyter", issues[0])
+
+    def test_full_continuation_passes(self) -> None:
+        lines = [
+            _line(100, 41, 570, "• Shipped a long service that fills the measure and then"),
+            _line(113, 50, 560, "auto-filing deduplicated issues across the whole pipeline"),
+        ]
+        self.assertEqual(short_last_lines(lines), [])
+
+    def test_short_one_line_bullet_passes(self) -> None:
+        lines = [
+            _line(100, 41, 570, "• Shipped a long service that fills the measure completely"),
+            _line(113, 41, 180, "• Patent citation stays on one line"),
+        ]
+        self.assertEqual(short_last_lines(lines), [])
+
+    def test_date_column_passes(self) -> None:
+        lines = [
+            _line(100, 36, 560, "A heading long enough to reach the right margin here"),
+            _line(100, 470, 576, "Dec. 2022 – Present"),
+        ]
+        self.assertEqual(short_last_lines(lines), [])
+
+    def test_section_header_passes(self) -> None:
+        lines = [
+            _line(100, 36, 560, "Languages: Python, JavaScript, TypeScript, Java, C/C++, Rust"),
+            _line(114, 36, 100, "Experience", size=12),
+        ]
+        self.assertEqual(short_last_lines(lines), [])
+
+    def test_master_pdf_has_no_stub_wraps(self) -> None:
+        pdf = ROOT / "master" / "Joseph_Yu_resume.pdf"
+        if not pdf.is_file():
+            self.skipTest("master PDF not built")
+        lines = visual_lines(pdf)
+        if lines is None:
+            self.skipTest("PyMuPDF not installed")
+        self.assertEqual(short_last_lines(lines), [])
 
 
 class PdfPageCount(unittest.TestCase):
